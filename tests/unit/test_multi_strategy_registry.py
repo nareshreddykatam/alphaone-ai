@@ -31,43 +31,47 @@ def _make_ohlcv(n: int, seed: int, freq_minutes: int) -> pd.DataFrame:
 
 # ---- Registry structure ----
 #
-# The registry holds 12 entries: the original 10 (S01-S10) plus 2
+# The registry holds 15 entries: the original 10 (S01-S10) plus 2
 # replacement candidates (S11, S12) investigated during the v2 rigorous
-# research pass and REJECTED -- kept in the registry (fully implemented,
-# tested, excluded from live evaluation) as a transparent record rather
-# than silently deleted. Only S05 and S06 are PRODUCTION_ELIGIBLE; see
-# services/signal_engine/multi_strategy.py's module docstring and
-# reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt for why.
+# research pass and REJECTED, plus 3 more candidates (V3_KAMA_TREND_4H,
+# V3_RANGE_EXPANSION_4H, V3_HMA_TREND_4H) investigated during the v3 pass --
+# kept in the registry (fully implemented, tested, excluded from live
+# evaluation when not PRODUCTION_ELIGIBLE) as a transparent record rather
+# than silently deleted. S05, S06, V3_KAMA_TREND_4H, and V3_RANGE_EXPANSION_4H
+# are PRODUCTION_ELIGIBLE; see services/signal_engine/multi_strategy.py's
+# module docstring, reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt, and
+# reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt for why.
 
-def test_registry_has_exactly_twelve_strategies():
-    assert len(MULTI_STRATEGY_REGISTRY) == 12
+def test_registry_has_exactly_fifteen_strategies():
+    assert len(MULTI_STRATEGY_REGISTRY) == 15
     ids = [d.strategy_id for d in MULTI_STRATEGY_REGISTRY]
     assert len(ids) == len(set(ids)), "strategy_id must be unique"
 
 
 def test_timeframe_distribution_matches_spec():
-    """5 candidates at 15m (4 original + 1 rejected replacement), 7 at 4h
-    (6 original + 1 rejected replacement)."""
+    """5 candidates at 15m (4 original + 1 rejected replacement), 10 at 4h
+    (6 original + 1 rejected v2 replacement + 3 v3 candidates)."""
     by_tf = {}
     for d in MULTI_STRATEGY_REGISTRY:
         by_tf.setdefault(d.timeframe, []).append(d.strategy_id)
     assert len(by_tf["15m"]) == 5
-    assert len(by_tf["4h"]) == 7
+    assert len(by_tf["4h"]) == 10
 
 
-def test_only_s05_and_s06_are_production_eligible():
-    """Under the stricter v2 methodology, only S06 (of the new/replacement
-    candidates) cleared the production bar; S05 keeps its status by
-    explicit protection, not because the stricter test independently
-    re-validates it. Every other candidate -- including both REJECTED
-    replacements -- must never be PRODUCTION_ELIGIBLE."""
+def test_only_s05_s06_and_v3_survivors_are_production_eligible():
+    """Under the stricter v2/v3 methodology, only S06, V3_KAMA_TREND_4H, and
+    V3_RANGE_EXPANSION_4H (of the new/replacement candidates) cleared the
+    production bar; S05 keeps its status by explicit protection, not
+    because the stricter test independently re-validates it. Every other
+    candidate -- including every REJECTED replacement -- must never be
+    PRODUCTION_ELIGIBLE."""
     eligible = {d.strategy_id for d in MULTI_STRATEGY_REGISTRY if d.production_status == "PRODUCTION_ELIGIBLE"}
-    assert eligible == {"S05_DONCHIAN_ADX_4H", "S06_SUPERTREND_ATR_4H"}
+    assert eligible == {"S05_DONCHIAN_ADX_4H", "S06_SUPERTREND_ATR_4H", "V3_KAMA_TREND_4H", "V3_RANGE_EXPANSION_4H"}
 
 
 def test_rejected_candidates_are_excluded_from_live_evaluation():
     rejected = [d for d in MULTI_STRATEGY_REGISTRY if d.production_status == "REJECTED"]
-    assert {d.strategy_id for d in rejected} == {"S11_ZSCORE_REVERSION_15M", "S12_STRUCTURE_RETEST_4H"}
+    assert {d.strategy_id for d in rejected} == {"S11_ZSCORE_REVERSION_15M", "S12_STRUCTURE_RETEST_4H", "V3_HMA_TREND_4H"}
     for d in rejected:
         assert d.production_status != "PRODUCTION_ELIGIBLE"
 
@@ -107,7 +111,8 @@ def test_every_strategy_has_a_non_empty_disclaimer_in_its_reasoning():
         assert len(result.reasoning) > 20
         assert (
             "RESEARCH_ONLY" in result.reasoning or "PRODUCTION" in result.reasoning
-            or "REJECTED" in result.reasoning or d.strategy_id == "S06_SUPERTREND_ATR_4H"
+            or "REJECTED" in result.reasoning
+            or d.strategy_id in ("S06_SUPERTREND_ATR_4H", "V3_KAMA_TREND_4H", "V3_RANGE_EXPANSION_4H")
         )
 
 

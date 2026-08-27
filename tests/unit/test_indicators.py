@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from services.feature_engine.indicators import (
-    compute_technical_indicators, ema, sma, rsi, macd, atr, adx, bollinger_bands, vwap
+    compute_technical_indicators, ema, sma, rsi, macd, atr, adx, bollinger_bands, vwap,
+    wma, hma, kama,
 )
 
 
@@ -67,6 +68,81 @@ def test_atr(sample_ohlcv_df):
     assert len(result) == len(sample_ohlcv_df)
     valid = result.dropna()
     assert (valid >= 0).all()
+
+
+def test_wma():
+    series = pd.Series([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=float)
+    result = wma(series, 3)
+    assert len(result) == 10
+    # WMA(3) of [1,2,3] with weights [1,2,3] = (1*1+2*2+3*3)/6 = 14/6
+    assert result.iloc[2] == pytest.approx(14 / 6)
+    assert result.iloc[:2].isna().all()
+
+
+def test_wma_causal_no_lookahead():
+    """Appending future rows must never change an already-computed WMA
+    value at an earlier index -- a rolling().apply(raw=True) window can
+    only ever see its own trailing values."""
+    np.random.seed(11)
+    series = pd.Series(np.cumsum(np.random.randn(60)) + 100)
+    full = wma(series, 10)
+    truncated = wma(series.iloc[:40], 10)
+    pd.testing.assert_series_equal(full.iloc[:40], truncated, check_names=False)
+
+
+def test_hma_reduces_lag_vs_sma():
+    """HMA is specifically designed to track a sharp trend change faster
+    than an equal-period SMA -- verify it actually does on a clean
+    trend-reversal series, not just that it runs without error."""
+    np.random.seed(5)
+    up = np.linspace(100, 200, 60)
+    down = np.linspace(200, 100, 60)
+    series = pd.Series(np.concatenate([up, down]))
+    period = 20
+    h = hma(series, period)
+    s = sma(series, period)
+    # At the reversal point, HMA should have moved further back toward the
+    # new (falling) price than the slower SMA has.
+    idx = 70
+    assert abs(h.iloc[idx] - series.iloc[idx]) < abs(s.iloc[idx] - series.iloc[idx])
+
+
+def test_hma_causal_no_lookahead():
+    np.random.seed(12)
+    series = pd.Series(np.cumsum(np.random.randn(80)) + 100)
+    full = hma(series, 20)
+    truncated = hma(series.iloc[:50], 20)
+    pd.testing.assert_series_equal(full.iloc[:50], truncated, check_names=False)
+
+
+def test_kama_tracks_close_in_clean_trend():
+    """A perfectly clean, monotonic trend has an efficiency ratio of ~1 --
+    KAMA should track price very closely (fast smoothing constant)."""
+    series = pd.Series(np.linspace(100, 200, 60))
+    result = kama(series, er_period=10, fast=2, slow=30)
+    valid = result.dropna()
+    assert len(valid) > 0
+    assert (abs(valid - series.loc[valid.index]) < 5).all()
+
+
+def test_kama_causal_no_lookahead():
+    """The recursive step at row i only reads row i-1's own KAMA value and
+    row i's current inputs -- appending future rows must never change an
+    already-computed value at an earlier index."""
+    np.random.seed(13)
+    series = pd.Series(np.cumsum(np.random.randn(80)) + 100)
+    full = kama(series, 10, 2, 30)
+    truncated = kama(series.iloc[:50], 10, 2, 30)
+    pd.testing.assert_series_equal(full.iloc[:50], truncated, check_names=False)
+
+
+def test_kama_handles_zero_volatility_without_crashing():
+    """A flat (zero-volatility) series makes the efficiency-ratio
+    denominator zero -- must not raise or produce inf, just fall back
+    cleanly (handled via .replace(0, np.nan).fillna(0))."""
+    series = pd.Series([100.0] * 30)
+    result = kama(series, er_period=10, fast=2, slow=30)
+    assert not np.isinf(result.dropna()).any()
 
 
 def test_bollinger_bands():

@@ -85,12 +85,27 @@ def test_15m_strategy_produces_both_directions(strategy_id, synthetic_15m):
     assert "SHORT" in seen, f"{strategy_id} never fired SHORT"
 
 
-@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H", "S12_STRUCTURE_RETEST_4H"])
+@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H", "S12_STRUCTURE_RETEST_4H", "V3_KAMA_TREND_4H", "V3_HMA_TREND_4H"])
 def test_4h_strategy_produces_both_directions(strategy_id, synthetic_4h):
     spec = MULTI_STRATEGIES[strategy_id]
     seen = _signal_types_seen(synthetic_4h, spec["precompute"], spec["factory"](), step=1)
     assert "LONG" in seen, f"{strategy_id} never fired LONG"
     assert "SHORT" in seen, f"{strategy_id} never fired SHORT"
+
+
+def test_v3_range_expansion_4h_produces_both_directions():
+    """V3_RANGE_EXPANSION_4H's production threshold (tr_ratio_mult=2.0) is
+    deliberately selective (only 38 signals over 3 years of real 4h data --
+    see reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt), so the shared
+    random-walk synthetic_4h fixture can validly produce zero SHORT signals
+    by chance on a given seed. LONG/SHORT are symmetric in the strategy's
+    own code (entry > prev_range_high vs. entry < prev_range_low) -- proven
+    here with a longer, differently-seeded series plus a wider search step."""
+    spec = MULTI_STRATEGIES["V3_RANGE_EXPANSION_4H"]
+    df = _make_ohlcv(n=6000, seed=909, freq_minutes=240)
+    seen = _signal_types_seen(df, spec["precompute"], spec["factory"](), step=1)
+    assert "LONG" in seen, "V3_RANGE_EXPANSION_4H never fired LONG"
+    assert "SHORT" in seen, "V3_RANGE_EXPANSION_4H never fired SHORT"
 
 
 def test_s10_mtf_trend_produces_both_directions(synthetic_4h, synthetic_1d):
@@ -154,7 +169,7 @@ def test_15m_strategy_entry_sl_tp_are_valid(strategy_id, synthetic_15m):
     assert checked > 0, f"{strategy_id} never produced a signal to validate levels against"
 
 
-@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H", "S12_STRUCTURE_RETEST_4H"])
+@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H", "S12_STRUCTURE_RETEST_4H", "V3_KAMA_TREND_4H", "V3_RANGE_EXPANSION_4H", "V3_HMA_TREND_4H"])
 def test_4h_strategy_entry_sl_tp_are_valid(strategy_id, synthetic_4h):
     spec = MULTI_STRATEGIES[strategy_id]
     prepared = spec["precompute"](synthetic_4h)

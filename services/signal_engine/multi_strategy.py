@@ -38,6 +38,24 @@ evaluated by the live scheduler (services/signal_engine/multi_strategy_engine.py
 completeness and the frontend's signal-history filters, but never generate
 a live signal, never persist a Signal row, and never reach Telegram.
 
+STRATEGY RESEARCH V3 (reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt,
+scripts/research_v3_discovery.py + scripts/research_v3_validation.py) added
+a further, wider candidate search (~23 genuinely distinct mechanisms across
+15m and 4h) using the SAME train/val/OOS/walk-forward methodology, plus a
+cost-robustness stress test V2 did not have. Every one of the 14 new 15m
+mechanisms tested failed a cheap full-period screen decisively (PF 0.23-0.70)
+-- combined with V2's five, AlphaOne has now tested 18 genuinely distinct 15m
+mechanisms with zero surviving even a full-period screen. Of 9 new 4h
+mechanisms, three cleared the screen; after full OOS rigor, two are new
+PRODUCTION_ELIGIBLE strategies (V3_KAMA_TREND_4H, V3_RANGE_EXPANSION_4H) and
+one is REJECTED (V3_HMA_TREND_4H -- OOS PF exactly 1.00 with a negative net
+return, a losing LONG side, and a decisive cost-stress-test failure). S06 was
+independently re-evaluated on the current dataset per explicit instruction
+(not assumed to remain eligible just because V2 promoted it) and remains
+PRODUCTION_ELIGIBLE with the same modest, LONG-carries profile V2 found. S05
+remains untouched and protected; V2's finding that it does not clear this
+stricter bar either still stands and was not re-litigated.
+
 Every strategy independently returns LONG / SHORT / NO_TRADE. There is no
 consensus requirement and no cross-strategy suppression -- see
 multi_strategy_engine.py.
@@ -221,6 +239,52 @@ _DISCLAIMERS = {
         "walk-forward folds profitable -- REJECTED, no replacement of any "
         "existing 4h slot."
     ),
+    "V3_KAMA_TREND_4H": (
+        "STRATEGY RESEARCH V3 result (train/val/OOS split, frozen er_period="
+        "10, selected on VALIDATION only): OOS PF 1.85, return +5.55%, max "
+        "drawdown 1.94%, 3/4 OOS walk-forward folds profitable. Both sides "
+        "profitable (LONG PF 1.39, SHORT PF 2.50) and profitable in every "
+        "regime tested (bull/bear/high-vol/low-vol). Survives a cost-"
+        "robustness stress test (2x fee, 3x slippage, 2x funding: PF 1.58, "
+        "return +3.96%). Fine-grained parameter sensitivity (er_period "
+        "9/10/11/12) found a genuine positive neighborhood (PF 1.23-1.85), "
+        "not an isolated lucky spike. One caveat disclosed rather than "
+        "hidden: OOS walk-forward fold 3 (10 trades, 100% win rate, PF "
+        "351 -- essentially no losers) contributed roughly 63% of the total "
+        "OOS return; the other 3 folds were far more modest (one of them, "
+        "fold 2, was a small loss). The strongest candidate found in this "
+        "pass, but still a research heuristic with real fold-concentration "
+        "risk -- never a guaranteed or maximum-profit outcome."
+    ),
+    "V3_RANGE_EXPANSION_4H": (
+        "STRATEGY RESEARCH V3 result (train/val/OOS split, frozen "
+        "tr_ratio_mult=2.0, selected on VALIDATION only): OOS PF 1.42, "
+        "return +2.73%, max drawdown 1.95%, 4/4 OOS walk-forward folds "
+        "profitable -- the most walk-forward-consistent of every candidate "
+        "in this pass, with no single fold dominating the result. Both "
+        "sides profitable (LONG PF 1.31, SHORT PF 1.54). Survives a cost-"
+        "robustness stress test (PF 1.23, return +1.53% under 2x fee/3x "
+        "slippage/2x funding). Extended parameter sensitivity (tr_ratio_mult "
+        "2.0-2.75) found performance improving further as the threshold "
+        "rises (fewer, higher-quality trades), not collapsing -- 2.0 is not "
+        "a fragile edge-of-grid pick. REGIME DEPENDENT, disclosed not "
+        "hidden: profitable specifically in bear/high-volatility OOS "
+        "regimes (PF 2.38 / 2.91) but LOSES money in bull/low-volatility "
+        "OOS regimes (PF 0.75 / 0.93, net negative in both). Treat this as "
+        "a volatility/breakout-conditions strategy, not an all-weather one."
+    ),
+    "V3_HMA_TREND_4H": (
+        "Investigated in STRATEGY RESEARCH V3 (Hull MA cross, reduced-lag "
+        "alternative to S02/S08's EMA-based trend logic). Full-period "
+        "screen was already marginal (PF 1.03). Rigorous OOS result (frozen "
+        "period=15): PF exactly 1.00 with a NEGATIVE net return (-0.04%), a "
+        "losing LONG side (PF 0.82, net -148.92) masked by a profitable "
+        "SHORT side (PF 1.26) in the combined number, only 2/4 OOS "
+        "walk-forward folds profitable, and a decisive failure under the "
+        "cost-robustness stress test (PF 0.85, return -2.13% under 2x fee/"
+        "3x slippage/2x funding). REJECTED -- no replacement of "
+        "V3_KAMA_TREND_4H or V3_RANGE_EXPANSION_4H."
+    ),
 }
 
 
@@ -312,6 +376,21 @@ MULTI_STRATEGY_REGISTRY: list[StrategyDefinition] = [
         strategy_id="S12_STRUCTURE_RETEST_4H", display_name="Structure Breakout + Retest", timeframe="4h",
         data_mode="CLOSED_CANDLE", production_status="REJECTED",
         make_strategy=lambda: _make_rule_based("S12_STRUCTURE_RETEST_4H"),
+    ),
+    StrategyDefinition(
+        strategy_id="V3_KAMA_TREND_4H", display_name="KAMA Adaptive Trend", timeframe="4h",
+        data_mode="CLOSED_CANDLE", production_status="PRODUCTION_ELIGIBLE",
+        make_strategy=lambda: _make_rule_based("V3_KAMA_TREND_4H"),
+    ),
+    StrategyDefinition(
+        strategy_id="V3_RANGE_EXPANSION_4H", display_name="Range Expansion Breakout", timeframe="4h",
+        data_mode="CLOSED_CANDLE", production_status="PRODUCTION_ELIGIBLE",
+        make_strategy=lambda: _make_rule_based("V3_RANGE_EXPANSION_4H"),
+    ),
+    StrategyDefinition(
+        strategy_id="V3_HMA_TREND_4H", display_name="Hull MA Trend", timeframe="4h",
+        data_mode="CLOSED_CANDLE", production_status="REJECTED",
+        make_strategy=lambda: _make_rule_based("V3_HMA_TREND_4H"),
     ),
 ]
 

@@ -1,6 +1,8 @@
-"""Signal functions for the 9 NEW independent strategies (S01-S04 at 15m,
-S06-S10 at 4h) requested alongside the existing validated S05 (Donchian+ADX,
-services/signal_engine/strategy.py's BaselineStrategy -- untouched).
+"""Signal functions for the NEW independent strategies (S01-S04 at 15m,
+S06-S10 at 4h from V2; S11/S12 and the V3_* candidates added in later
+research passes) requested alongside the existing validated S05
+(Donchian+ADX, services/signal_engine/strategy.py's BaselineStrategy --
+untouched).
 
 Same contract as ml/evaluation/baselines.py: each `_signal(df) -> dict|None`
 closure is fed straight into services.backtester.engine.Backtester.run(),
@@ -18,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from services.feature_engine.indicators import (
-    ema, rsi, atr, adx, macd, bollinger_bands, vwap_session, sma, supertrend,
+    ema, rsi, atr, adx, macd, bollinger_bands, vwap_session, sma, supertrend, kama, hma,
 )
 
 
@@ -569,6 +571,151 @@ def structure_retest_signal_func(lookback_break: int = 8, retest_atr_mult: float
 
 
 # ---------------------------------------------------------------------------
+# V3_KAMA_TREND_4H -- KAMA Adaptive Trend (4h)
+#
+# Hypothesis: Kaufman's Adaptive Moving Average speeds up in a clean trend
+# and flattens in chop (its smoothing constant is driven by the market's own
+# efficiency ratio, not a fixed period), so a price/KAMA cross with the KAMA
+# line itself already sloping in the cross direction should filter out more
+# whipsaws than a fixed-period MA cross (S02, S08) does. Genuinely distinct
+# construction from every existing 4h trend strategy (S06 uses Supertrend's
+# ATR-band flip; S08 requires a 3-EMA stack).
+#
+# Investigated in STRATEGY RESEARCH V3 (reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt).
+# Frozen parameter (er_period=10) selected on VALIDATION only, never re-tuned
+# after OOS -- see scripts/research_v3_validation.py.
+# ---------------------------------------------------------------------------
+
+def precompute_kama_trend(df: pd.DataFrame, period: int = 10) -> pd.DataFrame:
+    df = df.copy()
+    df["_kama"] = kama(df["close"], period, 2, 30)
+    df["_atr_14"] = atr(df["high"], df["low"], df["close"], 14)
+    return df
+
+
+def kama_trend_signal_func(flat_bars: int = 3):
+    def _signal(df: pd.DataFrame) -> dict | None:
+        if len(df) < 40:
+            return None
+        last, prev = df.iloc[-1], df.iloc[-2]
+        if pd.isna(last["_kama"]) or pd.isna(prev["_kama"]) or pd.isna(last["_atr_14"]) or last["_atr_14"] <= 0:
+            return None
+        if len(df) < flat_bars + 1 or pd.isna(df["_kama"].iloc[-1 - flat_bars]):
+            return None
+
+        entry = last["close"]
+        kama_slope = last["_kama"] - df["_kama"].iloc[-1 - flat_bars]
+        crossed_up = prev["close"] <= prev["_kama"] and entry > last["_kama"] and kama_slope > 0
+        crossed_down = prev["close"] >= prev["_kama"] and entry < last["_kama"] and kama_slope < 0
+        if crossed_up:
+            return {"signal_type": "LONG", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "LONG")}
+        if crossed_down:
+            return {"signal_type": "SHORT", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "SHORT")}
+        return None
+
+    return _signal
+
+
+# ---------------------------------------------------------------------------
+# V3_RANGE_EXPANSION_4H -- Range Expansion Breakout (4h)
+#
+# Hypothesis: a true-range spike well above its own recent average (a "range
+# expansion" bar), combined with a break of the prior N-bar high/low, marks
+# a genuine breakout with real participation behind it -- distinct from S05
+# (a plain Donchian breakout with no volatility-expansion precondition) and
+# S09 (a Bollinger-squeeze-then-expand construction; this strategy has no
+# squeeze precondition at all, only the expansion-bar-on-breakout itself).
+#
+# Investigated in STRATEGY RESEARCH V3 (reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt).
+# Frozen parameter (tr_ratio_mult=2.0) selected on VALIDATION only, never
+# re-tuned after OOS -- see scripts/research_v3_validation.py. Extended
+# sensitivity testing found performance actually improves further above 2.0
+# (fewer, higher-quality trades) rather than collapsing, so 2.0 is not a
+# fragile peak -- see the V3 report's parameter-robustness section.
+# Documented regime-dependent limitation: profitable in bear/high-volatility
+# OOS regimes, unprofitable in bull/low-volatility OOS regimes (see the
+# report) -- disclosed, not hidden.
+# ---------------------------------------------------------------------------
+
+def precompute_range_expansion_breakout(df: pd.DataFrame, range_period: int = 20) -> pd.DataFrame:
+    df = df.copy()
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1,
+    ).max(axis=1)
+    df["_tr_ratio"] = tr / tr.rolling(20).mean().replace(0, np.nan)
+    df["_range_high"] = df["high"].rolling(range_period).max()
+    df["_range_low"] = df["low"].rolling(range_period).min()
+    df["_atr_14"] = atr(df["high"], df["low"], df["close"], 14)
+    return df
+
+
+def range_expansion_breakout_signal_func(tr_ratio_mult: float = 2.0):
+    def _signal(df: pd.DataFrame) -> dict | None:
+        if len(df) < 30:
+            return None
+        last, prev = df.iloc[-1], df.iloc[-2]
+        cols = ("_tr_ratio", "_range_high", "_range_low", "_atr_14")
+        if any(pd.isna(last[c]) or (c in ("_range_high", "_range_low") and pd.isna(prev[c])) for c in cols) or last["_atr_14"] <= 0:
+            return None
+
+        entry = last["close"]
+        if last["_tr_ratio"] < tr_ratio_mult:
+            return None
+        if entry > prev["_range_high"]:
+            return {"signal_type": "LONG", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "LONG")}
+        if entry < prev["_range_low"]:
+            return {"signal_type": "SHORT", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "SHORT")}
+        return None
+
+    return _signal
+
+
+# ---------------------------------------------------------------------------
+# V3_HMA_TREND_4H -- Hull MA Trend (4h) -- REJECTED, kept for a transparent
+# record only (see StrategyDefinition status below).
+#
+# Hypothesis: the Hull Moving Average's reduced lag (vs. a plain EMA/SMA)
+# should make a price/HMA cross a cleaner, earlier trend signal.
+#
+# Investigated in STRATEGY RESEARCH V3. Full-period screen was already
+# marginal (PF 1.03); the rigorous OOS pass (frozen period=15, selected on
+# VALIDATION) came back at OOS PF 1.00 with a NEGATIVE net return, a losing
+# LONG side (PF 0.82), only 2/4 walk-forward folds profitable, and a
+# decisive failure under the cost-robustness stress test (2x fee/3x
+# slippage/2x funding: PF 0.85, return -2.13%) -- see the V3 report.
+# REJECTED, no replacement of V3_KAMA_TREND_4H or V3_RANGE_EXPANSION_4H.
+# ---------------------------------------------------------------------------
+
+def precompute_hma_trend(df: pd.DataFrame, period: int = 15) -> pd.DataFrame:
+    df = df.copy()
+    df["_hma"] = hma(df["close"], period)
+    df["_atr_14"] = atr(df["high"], df["low"], df["close"], 14)
+    return df
+
+
+def hma_trend_signal_func():
+    def _signal(df: pd.DataFrame) -> dict | None:
+        if len(df) < 40:
+            return None
+        last, prev = df.iloc[-1], df.iloc[-2]
+        if pd.isna(last["_hma"]) or pd.isna(prev["_hma"]) or pd.isna(last["_atr_14"]) or last["_atr_14"] <= 0:
+            return None
+
+        entry = last["close"]
+        hma_rising = last["_hma"] > prev["_hma"]
+        crossed_up = prev["close"] <= prev["_hma"] and entry > last["_hma"] and hma_rising
+        crossed_down = prev["close"] >= prev["_hma"] and entry < last["_hma"] and not hma_rising
+        if crossed_up:
+            return {"signal_type": "LONG", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "LONG")}
+        if crossed_down:
+            return {"signal_type": "SHORT", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "SHORT")}
+        return None
+
+    return _signal
+
+
+# ---------------------------------------------------------------------------
 # Registry -- mirrors ml/evaluation/baselines.py's BASELINE_STRATEGIES shape.
 # S05 (existing Donchian+ADX) is deliberately NOT here: it is never
 # re-implemented, only ever reused via services.signal_engine.strategy.
@@ -651,6 +798,27 @@ MULTI_STRATEGIES: dict[str, dict] = {
         "timeframe": "4h",
         "precompute": precompute_structure_retest,
         "factory": lambda: structure_retest_signal_func(8, 0.75),
+        "data_mode": "CLOSED_CANDLE",
+    },
+    "V3_KAMA_TREND_4H": {
+        "display_name": "KAMA Adaptive Trend",
+        "timeframe": "4h",
+        "precompute": lambda df: precompute_kama_trend(df, 10),
+        "factory": lambda: kama_trend_signal_func(3),
+        "data_mode": "CLOSED_CANDLE",
+    },
+    "V3_RANGE_EXPANSION_4H": {
+        "display_name": "Range Expansion Breakout",
+        "timeframe": "4h",
+        "precompute": lambda df: precompute_range_expansion_breakout(df, 20),
+        "factory": lambda: range_expansion_breakout_signal_func(2.0),
+        "data_mode": "CLOSED_CANDLE",
+    },
+    "V3_HMA_TREND_4H": {
+        "display_name": "Hull MA Trend",
+        "timeframe": "4h",
+        "precompute": lambda df: precompute_hma_trend(df, 15),
+        "factory": hma_trend_signal_func,
         "data_mode": "CLOSED_CANDLE",
     },
 }

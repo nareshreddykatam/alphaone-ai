@@ -10,6 +10,54 @@ def sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period).mean()
 
 
+def wma(series: pd.Series, period: int) -> pd.Series:
+    """Linearly-weighted moving average -- each rolling window only ever
+    sees its own `period` most-recent values (raw=True + a fixed weight
+    vector), strictly causal."""
+    weights = np.arange(1, period + 1, dtype=float)
+    return series.rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+
+def hma(series: pd.Series, period: int = 20) -> pd.Series:
+    """Hull Moving Average: WMA(2*WMA(n/2) - WMA(n), sqrt(n)) -- a
+    faster-reacting, less-lagging alternative to a plain EMA/SMA. Built
+    entirely from rolling-window WMAs, so it inherits their causality."""
+    half = max(1, period // 2)
+    sqrt_p = max(1, int(round(period ** 0.5)))
+    raw_hma = 2 * wma(series, half) - wma(series, period)
+    return wma(raw_hma, sqrt_p)
+
+
+def kama(series: pd.Series, er_period: int = 10, fast: int = 2, slow: int = 30) -> pd.Series:
+    """Kaufman's Adaptive Moving Average: an EMA whose smoothing constant
+    adapts to the market's own efficiency ratio (net directional move over
+    `er_period` bars, divided by the sum of bar-to-bar moves) -- tracks
+    price closely in a clean trend, flattens out in a choppy one. The
+    recursive step at row i only ever reads row i-1's own already-computed
+    KAMA value and row i's current inputs -- no future data."""
+    change = series.diff(er_period).abs()
+    volatility = series.diff().abs().rolling(er_period).sum()
+    er = (change / volatility.replace(0, np.nan)).fillna(0)
+    fast_sc = 2 / (fast + 1)
+    slow_sc = 2 / (slow + 1)
+    sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+
+    values = np.full(len(series), np.nan)
+    close = series.to_numpy()
+    sc_arr = sc.to_numpy()
+    first_valid = er_period
+    if first_valid >= len(series):
+        return pd.Series(values, index=series.index)
+    values[first_valid] = close[first_valid]
+    for i in range(first_valid + 1, len(series)):
+        prev = values[i - 1]
+        if np.isnan(prev) or np.isnan(sc_arr[i]):
+            values[i] = close[i]
+            continue
+        values[i] = prev + sc_arr[i] * (close[i] - prev)
+    return pd.Series(values, index=series.index)
+
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)

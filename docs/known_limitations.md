@@ -2,6 +2,23 @@
 
 Documented explicitly rather than left to be discovered later.
 
+## Multi-strategy research (v3, robust strategy discovery pass)
+
+A wider search (23 genuinely distinct mechanisms, ~3 years of real BTC/USDT
+data, the same train/val/OOS methodology V2 used plus a new cost-robustness
+stress test) found: **zero** of 14 fifteen-minute mechanisms tested cleared
+even a full-period screen (combined with V2's five, 18 distinct 15m
+mechanisms have now been tried with zero survivors -- treat "no 15m edge
+under this cost model" as a settled finding, not an open question). Of 9
+new 4h mechanisms, two are new PRODUCTION_ELIGIBLE strategies
+(V3_KAMA_TREND_4H, OOS PF 1.85; V3_RANGE_EXPANSION_4H, OOS PF 1.42, regime-
+dependent -- bear/high-vol only) and one was rejected after full rigor
+(V3_HMA_TREND_4H -- OOS PF exactly 1.00 with a negative return). S06 was
+independently re-evaluated on the current dataset (not assumed to remain
+eligible from V2) and remains PRODUCTION_ELIGIBLE with the same modest,
+LONG-carries profile V2 found. S05 was not touched. See
+`reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt` for full detail.
+
 ## Live Price + Live Signal audit (USDT primary / INR secondary, Live Chart)
 
 - **UI reversed from "INR-only" to "USDT primary, INR secondary."** The

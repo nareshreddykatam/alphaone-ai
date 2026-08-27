@@ -88,7 +88,7 @@ export default function SignalsPage() {
           <div>
             <h1 className="text-2xl font-bold">Signal History</h1>
             <p className="text-muted-foreground text-sm">
-              Research signals across 10 independent strategies -- LOW/MEDIUM/HIGH quality, not a validated accuracy claim.
+              Research signals across {strategies.length || "multiple"} independent strategies -- LOW/MEDIUM/HIGH quality, not a validated accuracy claim.
               Only PRODUCTION_ELIGIBLE strategies ever generate a live signal; the rest exist for research only.
             </p>
             <p className="text-muted-foreground text-xs mt-1">
