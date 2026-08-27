@@ -1,0 +1,174 @@
+============================================================
+ALPHAONE AI
+PHASE 2.6 FINAL VALIDATION
+============================================================
+
+1. RISK ENGINE CHANGES
+------------------------------------------------------------
+Root cause of the Phase 2.5 bug: record_trade_result()'s max-daily-loss
+branch AND max-drawdown branch both set the SAME `state.kill_switch` flag,
+and nothing ever cleared it. A single bad day therefore permanently ended
+a multi-year backtest.
+
+Fix: the three mechanisms are now fully independent (services/risk_engine/
+engine.py):
+  - Daily loss limit: enforced purely via `daily_pnl_pct`, which
+    `reset_daily()` already correctly zeroes at the next UTC day. No
+    longer touches kill_switch at all.
+  - Consecutive-loss cooldown: unchanged trigger logic, but now uses an
+    explicit precomputed `RiskState.cooldown_until` timestamp (set once
+    per streak) instead of recomputing elapsed time live. Exact boundary:
+    now < cooldown_until -> blocked, now >= cooldown_until -> allowed.
+  - Max-drawdown hard kill: the ONLY thing that sets `kill_switch`.
+    Survives daily resets and cooldown expiry indefinitely. Cleared only
+    by the new explicit `reset_hard_kill()` (deactivate_kill_switch() is
+    now a backward-compatible alias for it).
+
+New: `RiskStatus` enum (ACTIVE / DAILY_LIMIT / COOLDOWN / HARD_KILL) via
+`get_risk_status(now)` for observable, named state.
+
+SECOND BUG found while gathering this phase's own statistics (also fixed):
+Backtester.run() was passing each trade's return-on-ITS-OWN-NOTIONAL into
+the risk engine, which treats that number as return-on-ACCOUNT-EQUITY.
+Only equal for a 100%-of-equity trade (buy-and-hold). For normal
+risk-sized trades this wildly overstated the risk engine's internal
+drawdown relative to the real dollar equity curve, and skewed every
+subsequent position size (sizing reads state.current_equity). Fixed:
+Backtester now converts to `trade.pnl / equity_before_trade * 100` before
+handing it to the risk engine. Also fixed a related gap where the
+end-of-data forced position close never updated risk-engine state (zero
+effect on any trading decision, but fixed for consistency).
+
+All changes are fully backward compatible -- every pre-existing test
+passed unmodified.
+
+2. DAILY LOSS RESET
+------------------------------------------------------------
+Automatic at the next UTC calendar day. Verified: blocks same-day trades
+immediately after breach, remains blocked through the rest of that day,
+resumes the instant the UTC date changes -- and does NOT set the hard
+kill (the actual Phase 2.5 bug). See
+tests/unit/test_risk_engine_reset_semantics.py (daily-reset group).
+
+3. CONSECUTIVE LOSS COOLDOWN
+------------------------------------------------------------
+Configurable via existing RiskConfig fields (cooldown_consecutive_losses,
+cooldown_minutes) -- confirmed NOT hardcoded. Breakeven trades reset the
+streak under a new explicit, configurable policy
+(RiskConfig.breakeven_resets_consecutive_losses, default True). Exact
+boundary tested to the second. A hard kill correctly survives a cooldown
+expiring in the background.
+
+4. HARD KILL SWITCH
+------------------------------------------------------------
+Max-drawdown breach only. Survives UTC day changes and cooldown expiry
+indefinitely -- confirmed with a scenario that advances 30 simulated days
+and a cooldown many times shorter than that gap, with the hard kill still
+blocking at the end. Cleared only by explicit `reset_hard_kill()`.
+
+5. SIMULATED CLOCK
+------------------------------------------------------------
+Every risk decision takes `now` as a parameter; the engine itself never
+reads the system clock to make a decision. Verified with a scenario dated
+2023 that produces identical results regardless of the real machine date
+(tests/unit/test_risk_engine_reset_semantics.py::
+test_risk_decisions_use_only_the_provided_simulated_timestamp). Backtester
+passes the simulated candle timestamp at every decision point; paper/live
+callers rely on the `now=None -> datetime.utcnow()` default, unchanged.
+
+6. NEW TESTS
+------------------------------------------------------------
+- tests/unit/test_risk_engine_reset_semantics.py (21 tests): daily reset,
+  cooldown start/expiry/boundary, breakeven policy, hard-kill arm/survive/
+  manual-reset, simulated-clock isolation.
+- tests/unit/test_risk_engine_equity_tracking.py (2 tests): risk-engine
+  equity matches real dollar equity for risk-sized trades; tracks the
+  backtester's own equity curve exactly.
+- tests/integration/test_risk_engine_backtest_regression.py (7 tests): the
+  long multi-day scripted backtest -- daily limit block+resume, cooldown
+  start+expiry, win-resets-streak, catastrophic hard kill, ZERO trades
+  after the kill despite 15 more days of "sure win" signals in the
+  dataset, trades spread across >=3 distinct days before the kill. This is
+  the scale at which the original bug was only ever visible.
+
+7. FULL TEST RESULTS
+------------------------------------------------------------
+Passed:  154
+Failed:  0
+Skipped: 0
+(up from 124 at the start of this phase; `pytest tests/ -v`)
+
+8. 3-YEAR CONTINUOUS BASELINE RESULTS (actual, not manufactured)
+------------------------------------------------------------
+1h (26,280 candles, 2023-08-27 -> 2026-08-26):
+  Strategy      Trades WinRate  PF    Expectancy Sharpe Sortino MaxDD  NetReturn  Fees    Funding  First trade          Last trade
+  Buy&Hold      1      100.0%   13517 13517.35   0.58   0.00    0.0%   +135.17%   15.34   5813.79  2023-08-27 09:00     2026-08-26 06:00
+  EMA 9/21      180    40.0%    0.87  -4.09      -0.53  -0.49   10.26% -7.35%     582.69  5.59     2023-08-28 15:00     2024-07-21 17:00
+  RSI 14        222    39.2%    0.86  -4.21      -0.59  -0.64   10.40% -9.35%     572.44  -19.59   2023-08-30 01:00     2024-10-10 17:00
+  Donchian+ADX  139    42.5%    0.95  -1.49      -0.14  -0.13   10.37% -2.08%     466.13  16.28    2023-08-29 15:00     2024-02-26 09:00
+
+4h (6,570 candles):
+  Buy&Hold      1      100.0%   13461 13460.79   0.58   0.00    0.0%   +134.61%   15.31   5799.61  2023-08-27 16:00     2026-08-26 04:00
+  EMA 9/21      155    44.5%    1.12  3.60       0.43   7.07    9.68%  +5.58%     248.76  7.10     2023-09-01 00:00     2026-08-18 12:00
+  RSI 14        153    43.1%    1.06  1.80       0.23   3.36    6.14%  +2.75%     222.98  -39.69   2023-09-12 00:00     2026-08-26 04:00
+  Donchian+ADX  255    46.3%    1.19  5.79       0.80   3.69    5.90%  +14.77%    428.30  78.32    2023-09-11 16:00     2026-08-25 20:00
+
+Slippage: applied at fill time via ExchangeSpec.slippage_bps (default
+1bp), included in the entry/exit prices above -- not broken out as a
+separate cost line by the current reporting (see docs/exchange_assumptions.md).
+
+9. WALK-FORWARD REGRESSION
+------------------------------------------------------------
+Re-run after the risk-engine fix; unaffected in direction, minor numeric
+shifts from the equity-tracking correction (each fold already used a
+fresh risk engine so wasn't hit by the Phase 2.5 bug):
+  1h, 24 folds: EMA 11/24 profitable mean+0.04%; RSI 9/24 mean-0.81%;
+                Donchian+ADX 10/24 mean+0.26%
+  4h, 24 folds: EMA 13/24 profitable mean+0.07%; RSI 12/24 mean-0.13%;
+                Donchian+ADX 18/24 profitable mean+0.61%
+No strategy parameters were changed.
+
+10. RISK LOCKOUT STATISTICS (1h, captured via structlog event capture)
+------------------------------------------------------------
+  Strategy      Daily-limit events  Cooldown events  Hard-kill events
+  EMA 9/21      0                   42               1
+  RSI 14        0                   52               1
+  Donchian+ADX  0                   34               1
+(4h daily-limit/cooldown events were non-zero in the earlier pre-fix
+capture; all three 4h strategies had ZERO hard-kill events in the final
+corrected run, consistent with section 8's "last trade" dates reaching
+2026.)
+
+11. KNOWN ISSUES
+------------------------------------------------------------
+- All four baselines still hit either a genuine drawdown-based hard kill
+  (1h, ~10 months in) or trade profitably-adjacent-to-flat the whole
+  window (4h) -- none demonstrate a strong, unambiguous edge. This is a
+  reporting finding, not a code defect.
+- Take-profit still lacks the gap-aware fill treatment stop-loss got in
+  Phase 2.5 (docs/known_limitations.md).
+- OI capped at ~30 days, no historical liquidations -- exchange
+  limitations, unchanged.
+- No TP2/TP3/partial exits.
+- Slippage is applied but not broken out as its own line in
+  BacktestResult/reports -- it's embedded in fill prices.
+
+12. RECOMMENDATION FOR PHASE 3
+------------------------------------------------------------
+The risk engine is now trustworthy for continuous multi-year backtests:
+daily limits and cooldowns correctly self-heal, and the hard kill is
+correctly permanent-until-manual-reset rather than an accidental one. The
+1h results show all three baselines eventually hit a REAL ~10% drawdown
+after roughly 6-14 months and several dozen cooldown cycles -- an honest
+signal that these unoptimized rules don't have enough edge to survive
+sustained risk-managed trading at that configuration, not evidence of a
+lingering infrastructure bug. The 4h results (all three baselines trading
+the full 3 years, Donchian+ADX net +14.77% with PF 1.19 and Sharpe 0.80)
+are the most encouraging data point produced so far in this project, but
+one 3-year, non-independent sample and a still-modest walk-forward
+profitable-fold rate (18/24) do not constitute a verified edge -- it
+warrants a dedicated, skeptical follow-up (out-of-sample period held
+back, transaction-cost sensitivity check, and a significance test) before
+being treated as a real finding. The data/feature/backtest/risk
+foundation is ready for Phase 3 ML work.
+============================================================

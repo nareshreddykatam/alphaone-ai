@@ -1,0 +1,225 @@
+============================================================
+ALPHAONE AI -- INR-ONLY UI IMPLEMENTATION REPORT
+============================================================
+
+SCOPE: Display-only currency normalization. No trading logic, signal
+generation, risk engine, or position sizing was touched. No deployment
+was performed (dev servers only, for verification).
+
+------------------------------------------------------------
+1. FILES CHANGED
+------------------------------------------------------------
+
+Backend (new):
+- services/exchange/fx.py               -- USDT->INR conversion (real source)
+- services/common/__init__.py
+- services/common/currency.py           -- format_inr() for Telegram text
+- tests/unit/test_fx_conversion.py       (10 tests)
+- tests/unit/test_format_inr.py          (11 tests)
+
+Backend (modified):
+- apps/api/routers/dashboard.py         -- btc_price -> btc_price_inr/_usdt
+                                            + signal_*_inr fields + conversion meta
+- apps/api/routers/signals.py           -- entry/SL/TP1-3 *_inr fields + conversion meta
+- apps/api/routers/market.py            -- candle OHLC *_inr fields + conversion meta
+- services/telegram/bot.py              -- every $-formatted message -> format_inr()
+- tests/integration/test_api_phase4_flow.py       (field rename fix)
+- tests/integration/test_api_phase5_coindcx_flow.py (field rename fix)
+- tests/unit/test_telegram_bot.py       (₹ assertions)
+
+Frontend (new):
+- apps/web/lib/currency.ts              -- formatINR(), conversionStatusLabel()
+- apps/web/lib/currency.test.ts          (16 tests, vitest)
+- apps/web/vitest added as devDependency; "test": "vitest run" script added
+
+Frontend (modified):
+- apps/web/app/dashboard/page.tsx       -- all $ -> formatINR/₹; BTC price INR + unavailable state
+- apps/web/app/signals/page.tsx         -- entry/SL/TP1 -> *_inr, N/A when unconverted; conversion disclosure line
+- apps/web/app/trades/page.tsx          -- entry/exit/pnl -> formatINR; (INR) placeholder hints
+- apps/web/app/performance/page.tsx     -- Total P&L -> formatINR
+- apps/web/app/risk/page.tsx            -- Current Equity -> formatINR
+- apps/web/app/chart/page.tsx           -- candles rendered from *_inr fields, ₹ price formatter/tooltip,
+                                            "INR conversion unavailable" error state, source/status subtitle
+- apps/web/app/settings/page.tsx        -- deposit/withdrawal placeholders -> "Amount (INR)"
+- apps/web/components/SignalDisplay.tsx -- entry/sl/tp1 props -> pre-converted *Inr, formatINR
+- apps/web/components/PriceDisplay.tsx  -- (unused elsewhere, fixed for correctness) -> formatINR
+
+Docs:
+- docs/known_limitations.md             -- new "INR-only UI" section documenting every
+                                            conversion assumption made (see section 9 below)
+
+------------------------------------------------------------
+2. INR FORMATTER IMPLEMENTATION
+------------------------------------------------------------
+
+Two formatters, one per stack, both centralizing all currency display:
+
+- Frontend: apps/web/lib/currency.ts -- formatINR(value, {showSign}) using
+  Intl.NumberFormat('en-IN', {style:'currency', currency:'INR'}) for
+  correct native Indian digit grouping (lakhs/crores). Returns "N/A" for
+  null/undefined/NaN, never fabricates a number. showSign prefixes "+" for
+  positive P&L values (zero never gets a sign).
+- Backend/Telegram: services/common/currency.py -- format_inr(value,
+  show_sign) implements the same Indian-grouping algorithm natively in
+  Python (no formatting library dependency) for Telegram message text.
+
+Both were unit-verified against the spec's own examples: ₹1,600.00,
+₹1,00,000.00 (1 lakh), ₹10,00,000.00 (10 lakh), ₹1,23,45,678.90 (1.23 crore).
+
+------------------------------------------------------------
+3. INR CONVERSION IMPLEMENTATION
+------------------------------------------------------------
+
+services/exchange/fx.py: get_usdt_inr_rate() fetches CoinDCX's real public
+spot ticker (https://public.coindcx.com/exchange/ticker), reads the
+"USDTINR" market's last_price as the conversion rate. This is a real,
+directly-tradeable CoinDCX market -- a genuine, verifiable data source,
+not a fabricated multiplier.
+
+Deviation from the spec's suggested architecture, done deliberately and
+disclosed rather than silently: the spec's diagram included a
+"USDT/USD reference" hop before INR. That hop was dropped -- USDT is
+already a USD-pegged stablecoin and there is no real, documented USD
+reference source to insert there; adding one would mean fabricating a
+number to satisfy the diagram's shape rather than improving accuracy.
+CoinDCX's own USDT/INR spot market is used directly as the single,
+verifiable conversion source.
+
+Every converted value carries a full envelope: conversion_rate,
+conversion_timestamp (when CoinDCX reported that price),
+conversion_source ("CoinDCX USDT/INR spot ticker"), conversion_status
+(LIVE / STALE after 5 minutes / UNAVAILABLE if the ticker call fails).
+convert_usdt_to_inr() returns None -- never a guessed number -- if either
+the source amount or the rate is missing; the frontend renders "INR
+conversion unavailable" / "N/A" in that case, never a fake ₹ figure.
+Verified live: real rate fetched during testing was 99.43-99.97 INR per
+USDT (CoinDCX's real current market rate).
+
+------------------------------------------------------------
+4. DATA MODEL / "NO DOUBLE CONVERSION" HANDLING
+------------------------------------------------------------
+
+Per-value currency provenance was determined explicitly rather than
+guessed, and is documented in docs/known_limitations.md:
+
+- CoinDCX account balance/margin/positions: already native INR (the real
+  account is INR-margined, per Phase 5's DEFAULT_MARGIN_CURRENCY="INR"
+  decision) -- displayed via formatINR with NO conversion step.
+- Signal entry/SL/TP and dashboard btc_price: USDT-denominated (Binance-
+  sourced signal engine, unchanged since Phase 1-3) -- converted via
+  fx.py before display.
+- Manual trade-journal entries: assumed INR (user manually trades their
+  INR-margined CoinDCX account) -- no conversion step.
+- Chart candles: USDT-denominated (same Binance source) -- converted,
+  using one current rate applied uniformly across the series (no
+  documented historical USDT/INR rate history exists to do this per-bar
+  historically-accurately; disclosed in the chart's subtitle, not hidden).
+
+Raw values are preserved everywhere a conversion happens (e.g. dashboard
+exposes both btc_price_usdt and btc_price_inr) so nothing is destroyed
+internally, per spec section 13.
+
+Tests covering all of this: test_fx_conversion.py (rate fetch success/
+failure/staleness/caching, conversion math, never-fabricate-on-missing-
+input) and test_format_inr.py (Indian grouping at all magnitudes, sign
+handling, None handling).
+
+------------------------------------------------------------
+5. DASHBOARD CHANGES
+------------------------------------------------------------
+
+Total Equity / Available Balance / Used Margin: formatINR, no conversion
+(native INR). BTC Price: converted USDT->INR with live conversion_status;
+shows "INR conversion unavailable" if the rate can't be fetched (never a
+guessed number). Unrealized P&L / Today's P&L: formatINR with sign.
+Current Signal card now also passes through converted entry/SL/TP1/R:R
+for the day's latest signal (previously wired but never actually passed
+from the dashboard page -- now connected end-to-end).
+
+------------------------------------------------------------
+6. CHART CHANGES
+------------------------------------------------------------
+
+lightweight-charts candlestick series now plots *_inr OHLC values (not
+raw USDT), with a custom priceFormatter/axis formatter using formatINR so
+crosshair/tooltip/axis labels all show ₹ with Indian grouping. Signal
+markers use entry_price_inr. If the conversion is unavailable or any
+candle lacks an INR value, the chart shows "INR conversion unavailable"
+instead of silently rendering USDT numbers unlabeled. Subtitle discloses
+the live conversion source and status.
+
+------------------------------------------------------------
+7. TELEGRAM CHANGES
+------------------------------------------------------------
+
+Every message template in services/telegram/bot.py (send_signal,
+send_position_detected, send_exit_alert, send_exit, _cmd_account,
+_cmd_signal, _cmd_position, _cmd_trades, _cmd_performance, _cmd_today) now
+uses format_inr() -- zero remaining "$" characters. send_signal and
+_cmd_signal fetch a live USDT/INR rate and show "INR conversion
+unavailable" per-field if it can't be fetched, rather than falling back to
+a raw USDT number unlabeled.
+
+------------------------------------------------------------
+8. TESTS ADDED / FULL TEST COUNT
+------------------------------------------------------------
+
+Backend: +21 new tests (test_fx_conversion.py: 10, test_format_inr.py: 11).
+Full backend suite: 374 passed, 1 skipped, 0 failed (was 353 passed/1
+skipped before this change -- no existing coverage was reduced; 4 pre-
+existing tests were updated for the renamed/reformatted fields, not
+deleted).
+
+Frontend: +16 new tests (apps/web/lib/currency.test.ts, via vitest --
+added as a new devDependency since no JS test runner existed in this
+project before). All 16 pass, including explicit "never renders $ or
+USD/USDT" assertions.
+
+------------------------------------------------------------
+9. REMAINING USD/USDT OCCURRENCES -- WHY THEY ARE LEGITIMATE
+------------------------------------------------------------
+
+Grepped the entire frontend source tree (excluding node_modules/.next
+build output) for literal "$" and "USD": every remaining match is one of:
+(a) JavaScript template-literal syntax (${variable}), not a currency
+    symbol -- confirmed by manual inspection of every match, zero are
+    rendered to the user as a dollar sign.
+(b) The literal string "BTC/USDT" / "BTC/USDT PERPETUAL" -- the actual
+    CoinDCX trading-pair/instrument identity, which the spec explicitly
+    says must be preserved (section 15).
+No bare "USD" (as a currency label) exists anywhere in the frontend.
+Backend: grepped apps/api and services/telegram for literal "$" currency
+formatting -- zero remain (all converted to format_inr()).
+
+------------------------------------------------------------
+10. BROWSER / VERIFICATION STATUS
+------------------------------------------------------------
+
+Backend restarted with the new code (previous process was running stale
+pre-change code; restarted via TaskStop + relaunch, no trading logic
+touched by the restart) and reverified healthy (0 real trades, scheduler
+still running as before).
+
+Live-rendered and verified via the Browser pane against the real backend
+and real CoinDCX/market data (get_page_text + direct API/network
+inspection, since a screenshot could not be captured in this session --
+the pane was not visible for compositing):
+- Dashboard: TOTAL EQUITY ₹1,600.00, AVAILABLE ₹1,600.00, USED MARGIN
+  ₹0.00, BTC PRICE ₹78,52,224.64 (live, real CoinDCX-derived conversion),
+  UNREALIZED P&L "N/A" (honest, no open positions), TODAY'S P&L ₹0.00.
+  Zero $ anywhere.
+- Signals: table shows "N/A" for NO_TRADE rows (no fabricated price),
+  conversion-source disclosure line renders correctly.
+- Chart: candles API confirmed returning real open_inr/high_inr/low_inr/
+  close_inr computed from a live fetched rate (99.43-99.97); series wired
+  to plot these INR fields with a ₹ price formatter (canvas-rendered,
+  verified via network response + source code, not a pixel screenshot).
+- Performance: TOTAL P&L ₹0.00, backtest section (%-only, untouched).
+- Risk: CURRENT EQUITY ₹10,000.00 (internal notional, see limitations).
+- Trades/Settings: empty/placeholder states render correctly, no $.
+
+TypeScript type-check (tsc --noEmit): clean, zero errors.
+
+------------------------------------------------------------
+DONE. Implementation and verification complete. No deployment performed.
+============================================================

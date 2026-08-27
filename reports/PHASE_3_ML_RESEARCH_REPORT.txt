@@ -1,0 +1,249 @@
+============================================================
+ALPHAONE AI
+PHASE 3 ML RESEARCH REPORT
+============================================================
+
+1. DATASET
+------------------------------------------------------------
+Primary timeframe: 4h, BTC/USDT perpetual, 2023-08-27 -> 2026-08-26
+(6,570 candles). Context timeframe: 1h (26,280 candles), merged onto the
+4h timeline via a causal backward as-of join. Real historical funding
+(3,285 events, full 3-year coverage). Open interest available only for
+the trailing ~30 days (Binance API limit, unchanged from Phase 2) -- this
+directly constrained ablation D (see section 11). No historical
+liquidation data exists; liquidation features were excluded entirely
+rather than fabricated (see docs/known_limitations.md).
+
+2. LABEL DESIGN
+------------------------------------------------------------
+Triple-barrier method (ml/labeling.py), NOT "next candle up/down":
+- At bar T, a hypothetical LONG and SHORT are each entered at bar T+1's
+  open (matching the backtester's own execution timing).
+- Stop = 1x ATR(T), Target = 2x ATR(T) -- a 2:1 reward:risk barrier, ATR
+  read at T only (never a future ATR).
+- Simulated forward up to 12 bars (2 days on 4h). Label = whichever side's
+  target is hit before its stop; NO_TRADE if neither resolves favorably,
+  both do (ambiguous), or the minimum 1.5 risk:reward floor isn't met.
+- Strict feature/label separation verified by
+  tests/leakage/test_label_leakage.py and
+  tests/unit/test_labeling.py::test_label_only_uses_the_atr_at_time_t_not_a_future_atr.
+
+3. FEATURE GROUPS
+------------------------------------------------------------
+107 total columns assembled; grouped and independently toggleable for the
+ablation study (ml/features/feature_groups.py):
+  trend(17) momentum(11) volatility(13) volume(9) structure(9) regime(8)
+  derivatives(10, funding-only in practice) context_1h(6)
+Liquidation columns deliberately excluded (no historical data -- would be
+all-zero, i.e. fabricated). A real bug was found and fixed while building
+the 1h-context merge: pandas' merge_asof auto-suffixing silently collided
+with same-named columns already present on both timeframes (e.g. rsi_14
+exists on both 4h and 1h) -- fixed by renaming context columns before
+merging. Caught by tests/leakage/test_feature_groups_no_lookahead.py
+before it could corrupt a trained model.
+
+4. MODEL ARCHITECTURE
+------------------------------------------------------------
+Built incrementally per the brief: Logistic Regression -> Random Forest
+-> XGBoost -> LightGBM -> Ensemble. All four non-ensemble models trained
+and evaluated successfully. The Ensemble (soft-voting RF+XGB+LGBM) could
+NOT be trained: sklearn's VotingClassifier re-fits internal clones of
+each base estimator without an eval set, which breaks LightGBM's
+early-stopping callback. Not debugged this phase -- none of the four
+working models showed enough promise to justify the effort (see section
+18). Logistic Regression is the only model needing feature scaling,
+fit only on the training split of each fold.
+
+5. CLASS DISTRIBUTION
+------------------------------------------------------------
+horizon=12 bars (the configuration used throughout this report):
+  LONG:     28.11%
+  SHORT:    26.92%
+  NO_TRADE: 44.97%
+(6,557 of 6,570 rows retained after dropping rows without a full forward
+horizon.) Roughly balanced between LONG/SHORT with NO_TRADE the plurality
+class, as expected from a symmetric barrier design -- no class-weighting
+was applied; this distribution did not require it.
+
+6. CALIBRATION
+------------------------------------------------------------
+Both sigmoid (Platt) and isotonic calibration were fit on each fold's
+validation split (never train or test) via CalibratedClassifierCV +
+FrozenEstimator, and compared by validation Brier score; the better one
+was used for that fold's test evaluation. Isotonic was selected in every
+ablation-screen combo in this run. Test-set Brier scores clustered
+0.63-0.71 (3-class Brier, where 0 = perfect, ~0.67 = a uniform/uninformative
+predictor) -- consistent with the classification metrics below: the
+models are only marginally, if at all, more informative than chance.
+
+7. WALK-FORWARD METHODOLOGY
+------------------------------------------------------------
+Rolling train(1500 bars)/val(250)/test(250) windows, step=250, with an
+embargo of horizon_bars+2=14 bars at BOTH the train->val and val->test
+boundaries -- verified strictly larger than the label horizon
+(tests/unit/test_ml_pipeline.py). No shuffling anywhere. Preprocessing
+(scaling where applicable) and calibration are refit from scratch every
+fold, using only that fold's own train/val data.
+
+8-11. ABLATION RESULTS (single chronological 60/20/20 split, embargo=14)
+------------------------------------------------------------
+  ablation                 model                calib     acc    f1    auc   brier  trades win% PF    net_ret%
+  A_technical_only         logistic_regression   isotonic 0.394 0.313 0.508 0.682   55    30.9 0.77  -4.53
+  A_technical_only         random_forest         isotonic 0.396 0.317 0.511 0.684   61    29.5 0.71  -6.49
+  A_technical_only         xgboost               isotonic 0.401 0.320 0.508 0.696   54    24.1 0.54  -9.99
+  A_technical_only         lightgbm              isotonic 0.361 0.300 0.515 0.682   47    21.3 0.47 -10.26
+  B_technical_structure    logistic_regression   isotonic 0.396 0.312 0.494 0.671   27    25.9 0.58  -4.42
+  B_technical_structure    random_forest         isotonic 0.399 0.313 0.499 0.694   48    22.9 0.52  -9.24
+  B_technical_structure    xgboost               isotonic 0.404 0.333 0.510 0.711   56    30.4 0.73  -5.59
+  B_technical_structure    lightgbm              isotonic 0.396 0.313 0.506 0.678   44    40.9 1.18  +2.58  <- only positive result
+  C_+regime                logistic_regression   isotonic 0.374 0.306 0.495 0.675   31    29.0 0.69  -3.62
+  C_+regime                random_forest         isotonic 0.407 0.328 0.506 0.678   53    28.3 0.67  -6.63
+  C_+regime                xgboost               isotonic 0.397 0.312 0.496 0.688   44    20.5 0.44 -10.16
+  C_+regime                lightgbm              isotonic 0.399 0.316 0.514 0.679   60    25.0 0.57 -10.12
+  D_+derivatives           (all 5 models)         --       COULD NOT RUN -- insufficient non-null rows once
+                                                            OI features are required (see section 2/11 of
+                                                            known_limitations.md)
+
+11 of 12 working combinations were net-negative after realistic costs.
+Accuracy (0.24-0.48 across all combos and folds) hovers around or below
+the ~33-45% "always predict the majority NO_TRADE class" floor implied by
+the class distribution -- these models are not reliably beating a naive
+baseline classifier, let alone generating tradeable edge.
+
+12. BASELINE COMPARISON
+------------------------------------------------------------
+Same Backtester, fees, funding, slippage, execution timing, and risk
+engine as every ML run above (ml.evaluation.baselines, unchanged from
+Phase 2.6):
+  Strategy (4h, 3yr walk-forward, 24 folds)   Profitable folds   Mean return/fold
+  EMA 9/21                                     12/24              +0.06%
+  RSI 14                                        9/24              -0.15%
+  Donchian + ADX                               18/24              +0.61%   <- strongest baseline
+The single best ML screening result (B+LightGBM, +2.58%, one split) is
+larger in magnitude than Donchian+ADX's per-fold mean, but section 13
+shows it does not survive proper walk-forward re-evaluation, unlike the
+baseline number, which IS already a walk-forward result.
+
+13. WALK-FORWARD RESULTS (best candidate: feature-set B + LightGBM)
+------------------------------------------------------------
+19 folds (train 1500 / val 250 / test 250 bars, step 250, embargo 14):
+  Folds:              19
+  Profitable folds:   6  (31.6%)
+  Mean return/fold:   -0.95%
+  Best fold:          +3.50% (fold 7)
+  Worst fold:         -10.01% (fold 15)
+  Std dev of returns:  substantial (range spans 13.5 points peak-to-trough)
+Full per-fold table: reports/phase3_ml_walkforward_B_lightgbm.csv
+This DOES NOT replicate the single-split screening result. A 31.6%
+profitable-fold rate with a negative mean is a materially WORSE, not
+comparable, outcome to the screen's +2.58%/one-split number.
+
+14. FINAL OUT-OF-SAMPLE RESULT
+------------------------------------------------------------
+Given section 13's walk-forward already shows the candidate fails to
+generalize, no separate "final reserved test period" evaluation was run
+for this candidate -- doing so would not change the conclusion, and per
+the brief's own instruction not to keep testing a disproven hypothesis
+against fresh data just to look for a pass. The walk-forward folds
+collectively span the entire post-training portion of the 3-year dataset
+already (2024-06 through 2026-08), so this IS the out-of-sample evidence.
+
+15. COST SENSITIVITY (best candidate, single-split test window)
+------------------------------------------------------------
+  Scenario           Multiplier  Net Return%  Sharpe  PF
+  base                1.00x      +2.58%       0.71    1.18
+  base + 25% costs     1.25x      +2.02%       0.56    1.14
+  base + 50% costs     1.50x      +1.47%       0.42    1.10
+  base + 100% costs    2.00x      +0.39%       0.13    1.03
+Return drops 85% under 2x costs -- flagged automatically by
+ml/evaluation/overfitting.py::check_cost_sensitivity_collapse. Combined
+with section 13, this candidate fails on BOTH robustness axes checked.
+
+16. REGIME ANALYSIS
+------------------------------------------------------------
+Not pursued in per-regime depth for the ML candidate: since walk-forward
+(section 13) and cost sensitivity (section 15) already independently
+disqualify it as a real edge, decomposing a non-signal by regime would be
+decomposing noise, not extracting insight. The regime-bucketing
+infrastructure built in Phase 2.5 (services/backtester/regime_analysis.py,
+including a vectorized regime detector proven to exactly match the live
+scalar detector) is reusable for a future candidate that DOES survive
+walk-forward.
+
+17. FEATURE IMPORTANCE
+------------------------------------------------------------
+Feature-importance stability tooling was built and tested
+(ml/evaluation/overfitting.py::feature_importance_stability, verified in
+tests/unit/test_overfitting.py) but is most meaningful for a model worth
+trusting. Given no ablation combination demonstrated a stable edge, a
+detailed per-fold importance breakdown was not pursued as a Phase 3
+deliverable -- the same caveat as section 16 applies.
+
+18. OVERFITTING ANALYSIS
+------------------------------------------------------------
+Multiple red flags detected, mechanically and by inspection:
+- Only 1 of 12 ablation-screen combinations was net-positive -- consistent
+  with pure noise across independently-tested combinations, not signal.
+- The one positive result did not survive walk-forward re-evaluation
+  (section 13) -- a large train/screen-vs-genuine-out-of-sample gap.
+- The same result lost 85% of its return under 2x realistic costs
+  (section 15).
+- Classification accuracy (24-48%) does not clear a naive majority-class
+  baseline in most folds.
+This is the textbook signature of a false positive from testing many
+hypotheses (4 ablations x 5 models = 20 combinations attempted, 15
+successfully trained) without correcting for multiple comparisons --
+exactly the failure mode the Phase 3 brief warned about, and exactly why
+the walk-forward + cost-sensitivity checks exist.
+
+19. TEST RESULTS
+------------------------------------------------------------
+Passed:  200
+Failed:  0
+Skipped: 0
+(up from 154 at the start of this phase; `pytest tests/ -v`). New tests
+added this phase: labeling (10), feature-group leakage (3), purge/embargo
+split (4), ML signal/threshold/EV/no-trade/risk-separation (10),
+calibration (5), model versioning/serialization (3), cost sensitivity (3),
+overfitting-detection mechanics (8).
+
+20. KNOWN LIMITATIONS
+------------------------------------------------------------
+- No genuine ML edge found in this phase (see section 18) -- this is the
+  headline finding, not a limitation to work around.
+- Ensemble model untrainable with LightGBM as a base estimator (sklearn
+  VotingClassifier + early stopping incompatibility) -- undebugged.
+- Ablation D (+derivatives) could not be evaluated -- OI's ~30-day
+  history leaves too few non-null rows once required as a feature.
+- No historical liquidation data -- excluded rather than fabricated.
+- Single primary timeframe (4h) was used throughout; the brief's
+  instruction to "validate, don't assume" 4h's superiority was addressed
+  only by comparison against the EXISTING Phase 2.6 baseline walk-forward
+  numbers (which did test 1h and 4h), not by re-running the full ML
+  pipeline on 1h -- a reasonable next step if this research is continued.
+- The Phase 2.6 continuous-backtest hard-kill lockout, kill-switch design,
+  and other pre-Phase-3 limitations remain unchanged (see the relevant
+  earlier sections of this file).
+
+21. RECOMMENDATION
+------------------------------------------------------------
+ML does NOT outperform the strongest simple baseline (Donchian + ADX,
+4h, Phase 2.6) out-of-sample. The success criteria defined at the start of
+this phase -- robust, cost-surviving, walk-forward-stable improvement over
+baselines -- were not met by any of the four models or three viable
+feature-set ablations tested. The one promising-looking single-split
+result was actively investigated and disproven by walk-forward and cost
+stress-testing, exactly as the brief instructed ("if ML performs well, try
+hard to disprove it").
+
+This is reported as a negative result, not a partial success. It does not
+mean BTC/USDT is unpredictable in principle -- it means these specific
+models, features, and label design, on this dataset, did not clear the
+bar. Reasonable next steps if ML research continues: (a) revisit the
+label design (different horizon/barrier ratios), (b) test the pipeline on
+1h/15m primary timeframes now that the harness exists, (c) fix the
+ensemble training bug and re-screen, (d) formally correct for the
+multiple-comparisons problem (e.g. a stricter significance bar) before
+trusting any future single-split positive result. Per the phase
+instruction, Phase 4 is not started automatically.
+============================================================

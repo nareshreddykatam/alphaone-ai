@@ -1,0 +1,332 @@
+============================================================
+ALPHAONE AI
+LIVE MARKET DATA FINAL VALIDATION
+============================================================
+
+Frontend live status:            PASS
+INR display:                     PASS
+Dashboard visual verification:   PASS
+Real WebSocket connection:       PASS
+Authenticated WebSocket:         PASS
+Real reconnect test:             PASS
+30-60 minute soak test:          PASS (ran 30 minutes -- the low end of the requested range)
+Signal boundary:                 PASS
+Position boundary:               PASS
+Exit boundary:                   PASS
+Telegram state alerts:           PASS (mechanism real-tested; delivery not re-triggered live -- see section 9)
+Security/no-order:               PASS
+
+Backend tests:   428 passed, 1 skipped, 0 failed
+Frontend tests:  16 passed, 0 failed
+TypeScript:      clean (tsc --noEmit, 0 errors)
+Lint:            NOT CONFIGURED (next lint has no .eslintrc in this project -- prompts interactively to create one; pre-existing, not introduced by this work)
+
+Real trades placed: 0
+
+Production readiness: NOT READY (see section 13 for exactly why, and what would close the gap)
+
+============================================================
+DETAIL
+============================================================
+
+------------------------------------------------------------
+1. FRONTEND LIVE STATUS -- PASS
+------------------------------------------------------------
+
+New component apps/web/components/MarketStatusCard.tsx wired into
+apps/web/app/dashboard/page.tsx, replacing the old plain "BTC Price"
+card. Renders exactly the requested layout:
+
+  BTC/USDT PERPETUAL          ● LIVE
+  ₹78,12,912.97
+  Source: CoinDCX WebSocket
+  Updated: Updated 6.1s ago
+  Mark Price: ₹78,14,878.11
+
+A 1-second client-side ticking clock drives the "Updated Xs ago" text
+independent of the 10s data-poll interval, matching the sub-second
+precision in the requested example ("Updated 1.2s ago").
+
+------------------------------------------------------------
+2. MARKET DATA STATES -- PASS
+------------------------------------------------------------
+
+All four states visually verified in the real running browser:
+
+- LIVE: ● LIVE, real price, "Updated 6.1s ago" -- against the real live backend.
+- STALE: ⚠ STALE, "Updated 24s ago" -- verified by intercepting the
+  frontend's own fetch() to feed the real component a synthetic
+  STALE payload (done this way specifically to avoid disrupting the
+  live 30-minute soak test running concurrently against the same
+  backend -- killing the real connection to force STALE naturally
+  would have invalidated the soak run).
+- DISCONNECTED: 🔴 DISCONNECTED, last known price still shown but
+  clearly marked disconnected, not silently presented as live --
+  same fetch-interception technique.
+- UNAVAILABLE: "Market data unavailable" / "INR conversion unavailable"
+  -- same technique.
+
+All four exercise the actual production MarketStatusCard component code
+with real (LIVE) or synthetic-but-realistic (STALE/DISCONNECTED/
+UNAVAILABLE) props -- not a separate mock component.
+
+------------------------------------------------------------
+3. INR CONVERSION -- PASS
+------------------------------------------------------------
+
+Unmodified from the INR-only UI phase (services/exchange/fx.py). "INR
+conversion unavailable" verified to render (never a fabricated ₹ number)
+both in the UNAVAILABLE visual check above and in the pre-existing
+backend test test_dashboard_reports_conversion_unavailable_never_
+fabricates_inr.
+
+------------------------------------------------------------
+4. DASHBOARD VISUAL VERIFICATION -- PASS (real browser, not just unit tests)
+------------------------------------------------------------
+
+Opened the actual running Next.js dev server in the Browser pane and
+visually/textually confirmed, against the real live backend:
+- Main dashboard: Total Equity ₹1,600.00, Available ₹1,600.00, Used
+  Margin ₹0.00, Open Positions 0 -- all real CoinDCX account data.
+- BTC price, LIVE/STALE/DISCONNECTED/UNAVAILABLE status, source, updated
+  time, mark price -- section 2.
+- No $/USD/USDT monetary value anywhere on the page (BTC/USDT the
+  instrument name is the only legitimate occurrence, per the INR-only UI
+  phase's own established exception).
+- Chart page spot-checked for regression (unchanged this phase): real
+  200 OK candle responses, INR conversion-source subtitle intact.
+A true pixel screenshot could not be captured in this session (the
+Browser pane was not compositing frames for screenshot capture); text
+extraction plus live network-request inspection were used instead and
+give equivalent evidence for every field checked.
+
+------------------------------------------------------------
+5. REAL WEBSOCKET CONNECTION -- PASS
+------------------------------------------------------------
+
+Already established in the prior phase (real LTP 78032.0 USDT, real mark
+price 78031.9 USDT) and re-confirmed continuously throughout this
+session's dashboard verification and the 30-minute soak (section 6):
+59/59 samples over 30 minutes reported status=LIVE, zero drops.
+
+------------------------------------------------------------
+6. AUTHENTICATED WEBSOCKET -- PASS
+------------------------------------------------------------
+
+Covered by the separate follow-up completed earlier this session:
+services/exchange/coindcx_ws.py had the identical real-wire-format bug
+(142/142 real events crashed before the fix), fixed and reverified
+(80/80 events processed cleanly, real price 78216.9 captured). Not
+re-touched in this finalization pass, per "do not rewrite completed
+work."
+
+------------------------------------------------------------
+7. REAL RECONNECT TEST -- PASS
+------------------------------------------------------------
+
+scripts/coindcx_ws_reconnect_test.py, run against a throwaway connection
+(never the live soak-monitored backend, so the soak run was never
+disrupted). A genuine network-level drop was induced by forcibly closing
+the underlying aiohttp WebSocket transport directly (bypassing the
+client's own clean disconnect() path, which deliberately does NOT trigger
+reconnection) -- not a simulated/mocked drop. Results:
+
+  Real disconnect induced: True
+  DISCONNECTED state observed: True
+  Automatic reconnect observed: True (recovered in ~2 seconds)
+  Resubscribed after reconnect: True (2 join calls before -> 4 after --
+    exactly one full resubscription, no accumulating duplicates)
+  price_usdt before drop: 78510.0
+  price_usdt after recovery: 78508.1  (real ticks resumed, not just a
+    flipped status flag)
+  Connection-transition callback fired exactly once per real transition:
+    LIVE->DISCONNECTED, DISCONNECTED->LIVE, then a second natural
+    LIVE->DISCONNECTED as the test wound down -- no duplicate firing for
+    an unchanged state at any point.
+
+This exercises the exact same on_state_change callback mechanism that
+production wires to the Telegram alert + SyncEvent audit row (see
+section 9) -- a real, not mocked, proof that the dedup logic holds
+against a genuine connection drop.
+
+------------------------------------------------------------
+8. 30-MINUTE SOAK TEST -- PASS
+------------------------------------------------------------
+
+scripts/market_data_soak_monitor.py, polling the real running backend's
+dashboard API every 30s for 1800s (30 minutes -- the low end of the
+requested 30-60 minute range; run for 30 rather than 60 to keep this
+validation pass bounded, documented plainly rather than silently
+shortened). Results:
+
+  Total samples: 59, poll errors: 0
+  market_data_status observed: LIVE for all 59/59 samples -- zero
+    disconnects, zero STALE readings, for the entire 30-minute window
+  Real price range observed: 78,328.8 - 78,574.1 USDT (~0.3% natural
+    movement, consistent with real BTC volatility, not synthetic)
+  Signals in DB: 8 -> 10 (delta 2) -- see section 10 for why this is the
+    correct, expected number (scheduler-driven, not tick-driven)
+  Trades in DB: 0 -> 0 (delta 0) -- zero real trades
+  coindcx_market_ws connection-transition audit rows: 0 -> 0 (delta 0) --
+    correctly zero, since the connection never dropped during this window
+  Backend process memory: ~92MB RSS after ~33 minutes of continuous
+    operation (checked via PowerShell Get-CimInstance) -- stable, no
+    growth pattern indicative of a per-tick memory leak, consistent with
+    the "only latest state kept in memory, never per-tick persistence"
+    design.
+  Exceptions: none observed in backend logs during the window.
+  Heartbeat: implicit -- the connection never dropped, meaning the 25s
+    ping kept it alive correctly for the full 30 minutes without a single
+    timeout.
+
+------------------------------------------------------------
+9. SIGNAL BOUNDARY -- PASS
+------------------------------------------------------------
+
+Mock-level: test_feeding_many_ticks_never_generates_a_signal_or_sends_
+telegram (tests/integration/test_live_market_data_flow.py) feeds 50 live
+ticks directly and asserts zero calls to generate_and_persist_signal /
+notify_new_signal.
+
+Real-level (this session's soak, section 8): thousands of real ticks
+flowed in over 30 minutes (roughly one every 1-2 seconds, per the earlier
+connectivity tests' observed cadence), yet exactly 2 new Signal rows were
+created -- precisely matching 1800s / 900s (the existing, unmodified
+15-minute signal-generation scheduler interval) = 2 scheduler ticks.
+Both new rows carry the SAME candle timestamp (2026-08-26 04:00:00, the
+current still-open 4h candle) as every earlier NO_TRADE signal this
+session, confirming they came from the scheduler re-evaluating the latest
+candle on its own fixed cadence, not from any tick. Signal generation
+remains entirely candle-completion/scheduler-driven.
+
+------------------------------------------------------------
+10. POSITION BOUNDARY -- PASS
+------------------------------------------------------------
+
+The real account has zero open positions throughout this validation, so
+no live numeric PnL divergence between B-BTC_USDT and B-BTC_INR could be
+demonstrated directly -- documented honestly rather than fabricated.
+Verified instead by:
+- Architecture: test_market_ws_module_is_not_imported_by_position_or_
+  exit_monitoring asserts services/market_data/coindcx_ws.py is never
+  imported by services/position_monitor/monitor.py or
+  services/scheduler/jobs.py.
+- Real data separation observed live: /api/v1/accounts/balance returns
+  the real account's own INR-native figures (total_equity=1600.0,
+  currency_short_name="INR", raw CoinDCX wallet fields intact) with zero
+  reference to the WebSocket's B-BTC_USDT price; the dashboard's
+  market_data_mark_price_usdt (a live USDT number, ~78,400s) and the
+  account's own position/balance fields are structurally separate JSON
+  fields computed by entirely separate code paths, never combined.
+
+------------------------------------------------------------
+11. EXIT BOUNDARY -- PASS
+------------------------------------------------------------
+
+Unchanged from Phase 5: services/scheduler/jobs.py's exit_alert_job still
+runs its own 30-second REST poll of the real account's own positions,
+independent of the new public WebSocket (same import-boundary test as
+section 10 covers both). Not modified in this session.
+
+------------------------------------------------------------
+12. TELEGRAM STATE ALERTS -- PASS (with an honest caveat)
+------------------------------------------------------------
+
+The dedup mechanism (fire at most once per real transition, never per-
+tick or per-poll, never twice for an unchanged state) was real-tested in
+section 7's reconnect test, using the identical on_state_change callback
+signature/logic that production wires to TelegramBot.send_market_data_
+alert() in services/market_data/live_state.py. Mock-level coverage: 3
+tests in tests/unit/test_telegram_bot.py (both message variants, and the
+enabled/disabled gate). What was NOT done: deliberately forcing a real
+disconnect on the LIVE soak-monitored backend to watch an actual Telegram
+message arrive -- that would have required disrupting the very
+connection the soak test was measuring, and real Telegram message
+delivery capability was already separately proven working earlier this
+project (a real test message was confirmed delivered via a real
+message_id). Combining "dedup mechanism proven real" + "delivery
+mechanism proven real, separately" is judged sufficient without stacking
+both proofs onto the same live connection at the same time.
+
+------------------------------------------------------------
+13. SECURITY / NO-ORDER -- PASS
+------------------------------------------------------------
+
+Full security suite re-run: test_no_order_placement_capability.py (5
+tests, including the WebSocket-specific credential-free-constructor
+check) + test_coindcx_no_credential_logging.py (3 tests) -- 8/8 passed.
+No order placement/cancellation/modification/leverage-change/transfer/
+withdrawal capability exists anywhere (verified by introspection, not
+just by not calling it). No credential names or values found in frontend
+source (grepped apps/web -- only documentation text telling the user to
+set them server-side). No real credential value found in backend log
+output (grepped this session's actual log file for both real secret
+values -- zero matches; values never printed).
+
+============================================================
+PRODUCTION READINESS: NOT READY
+============================================================
+
+What's now real-verified (this session, on top of the prior phase):
+- Real reconnect-after-genuine-drop: PASS (was previously "not testable"
+  -- now closed).
+- Real 30-minute soak: PASS (was previously not run at all).
+- Real signal/position/exit architectural boundaries: PASS, backed by
+  live data, not just mocks.
+- Frontend now visually surfaces live market status (was the prior
+  phase's main open gap).
+
+Remaining gaps before this could be called production-ready:
+
+1. Only a 30-minute soak was run, not the full 60-minute upper end of the
+   requested range -- a longer window would give more confidence against
+   rarer failure modes (e.g. hours-long connections, daily CoinDCX
+   maintenance windows).
+2. A real transient failure was observed and is worth flagging plainly:
+   the live market-data WebSocket's very first connection attempt failed
+   once during this session's own restart ("Connection error") and did
+   NOT automatically retry -- start_market_data_ws() has no retry loop
+   around the initial connect, only python-socketio's built-in
+   reconnection (which only activates after a connection has succeeded
+   at least once). A manual backend restart worked around it for this
+   session's testing, but in a real deployment this would mean: if the
+   very first connection attempt at process startup fails, the live feed
+   would silently stay UNAVAILABLE forever until the process is manually
+   restarted, with no further attempts. This is a real, observed gap --
+   not fixed in this session, per "do not rewrite completed code"; a
+   startup-retry loop would be a natural, small follow-up.
+3. ESLint is not configured in this project at all (pre-existing, not
+   introduced here) -- "Lint if configured" could not be run.
+4. The suspected-and-now-confirmed-fixed authenticated-channel bug
+   (section 6 of the prior report) was fixed and reverified, but only
+   against a flat, zero-position, zero-order account -- df-position-
+   update and balance-update events specifically were never observed on
+   the real wire (the account never had position/balance activity during
+   any test this session), only price-change. The fix for those two
+   events' array-shaped payload is inferred from the same server's
+   uniform wrapping behavior (strong evidence, not direct observation)
+   and covered by mocked regression tests, but not a source of real
+   event data.
+5. Still running entirely as a local dev process (uvicorn --host
+   127.0.0.1), not in the target persistent backend/worker deployment
+   topology described in the request (separate Vercel frontend + a
+   separate always-on backend/worker) -- that separation is respected in
+   the code (the WebSocket only ever runs inside apps/api/main.py's
+   lifespan) but has not been deployed or tested in that topology.
+6. Telegram DISCONNECTED/RECOVERED delivery was not re-triggered live in
+   this exact session (section 12) -- the dedup mechanism and the
+   delivery mechanism were each proven real, separately, but never
+   stacked together in one live event during this validation pass.
+
+No trading logic, signal thresholds, risk management, or position sizing
+was changed in this session. No automatic trading capability exists or
+was added. Zero real orders were placed. No deployment was performed.
+MARKET_DATA_WS_ENABLED is currently left at `true` in the local .env from
+this validation session's testing -- explicitly noting this since it
+differs from the prior report's "left at false" state; still purely a
+local dev process, never deployed.
+
+============================================================
+DONE. Stopping here as instructed.
+DO NOT DEPLOY. DO NOT ENABLE AUTOMATIC TRADING.
+============================================================

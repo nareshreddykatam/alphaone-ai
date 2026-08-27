@@ -1,0 +1,72 @@
+============================================================
+ALPHAONE AI
+BTC/USDT PERPETUAL
+
+BACKTEST REPORT
+============================================================
+
+Period:
+2025-08-26 07:00:00 -> 2026-08-26 06:00:00
+
+Strategy:
+EMA Crossover (9/21) (v1)
+
+Timeframe:
+1h
+
+Trades:
+22
+
+Win Rate:
+18.18%
+
+Profit Factor:
+0.27
+
+Expectancy:
+-0.69 R
+
+Sharpe:
+-2.44
+
+Sortino:
+-0.99
+
+Maximum Drawdown:
+7.89%
+
+Net Return:
+-7.19%
+
+Initial Capital:
+$10,000.00
+
+Final Capital:
+$9,281.35
+
+Fees:
+$110.20
+
+Funding:
+$20.23
+
+Additional metrics:
+  Winning trades:        4
+  Losing trades:         18
+  Average trade:         $-32.67
+  Average winning trade: $67.49
+  Average losing trade:  $-54.92
+  Largest win:           $69.71
+  Largest loss:          $-58.15
+  Max consecutive wins:  1
+  Max consecutive losses:10
+  Recovery factor:       -0.9
+
+Dataset version:
+BTC/USDT:1h:8760rows:4f7ff2cc21df
+
+Code version:
+content:e473f83ad4e4be6f
+============================================================
+RESULT: This strategy LOST money over this period after costs.
+============================================================

@@ -1,0 +1,583 @@
+============================================================
+ALPHAONE AI
+PRODUCTION DEPLOYMENT READINESS REPORT
+============================================================
+
+Repository:                  PASS
+Environment configuration:   PASS
+Secrets:                     PASS
+PostgreSQL:                  PASS (static review; live migration NOT run -- see section 3)
+Migrations:                  PASS (static review; live migration NOT run -- see section 3)
+CORS:                        PASS
+Frontend production build:   PASS
+Backend production startup:  PASS
+Health checks:                PASS
+WebSocket lifecycle:         PASS
+Telegram configuration:      PASS
+CoinDCX configuration:       PASS
+Security:                    PASS
+
+Backend tests:   440 passed, 1 skipped, 0 failed
+Frontend tests:  16 passed, 0 failed
+TypeScript:      clean (tsc --noEmit, 0 errors)
+
+Recommended backend host: Railway (primary) -- see section 17
+Reason: cheapest/simplest option that genuinely supports an always-on
+process with a persistent outbound WebSocket, a background scheduler, and
+managed Postgres, without the free-tier idle-sleep problem that would
+silently kill the CoinDCX connection on Render's free tier.
+
+Deployment blockers: none that block STARTING a deployment, but three
+items should be closed out first -- see "DEPLOYMENT BLOCKERS" below.
+
+DO NOT DEPLOY -- this report is preparation only, per explicit instruction.
+
+============================================================
+DETAIL
+============================================================
+
+------------------------------------------------------------
+1. REPOSITORY AUDIT
+------------------------------------------------------------
+
+Frontend build command:      `npm run build` (apps/web/package.json ->
+                              `next build`). Verified: succeeds cleanly,
+                              all 10 routes prerendered as static content.
+Backend startup command:     `uvicorn apps.api.main:app --host 0.0.0.0
+                              --port 8000` (infrastructure/Dockerfile.api's
+                              CMD; no `--reload` -- correct for
+                              production). The scheduler, market-data
+                              WebSocket, and their retry/circuit-breaker
+                              logic all start from inside this same
+                              process's `lifespan`, gated by
+                              `SCHEDULER_ENABLED` / `MARKET_DATA_WS_ENABLED`
+                              -- no separate worker process/command exists
+                              or is needed.
+Python version:               `pyproject.toml` requires `>=3.11`.
+                              `infrastructure/Dockerfile.api` pins
+                              `python:3.11-slim`. This entire project's
+                              test suite has, in every session so far,
+                              only ever actually been RUN against a local
+                              Python 3.14 virtualenv -- the exact 3.11
+                              Docker combination has never been executed.
+                              Both satisfy the `>=3.11` constraint, but
+                              this is a real, flagged, untested
+                              combination (see "DEPLOYMENT BLOCKERS").
+Node version:                 v24.18.1 locally (no `engines` field in
+                              apps/web/package.json to pin one -- Vercel
+                              lets you select a Node version in project
+                              settings instead, so this is not a hard
+                              blocker, just worth setting explicitly there).
+Package managers:             pip (`pip install -e ".[dev]"`, via
+                              pyproject.toml/hatchling) for the backend;
+                              npm for the frontend (package-lock.json
+                              present).
+System dependencies:          Dockerfile.api installs `gcc` + `libpq-dev`
+                              (needed for `psycopg2-binary` to build/link
+                              against libpq) -- correctly present already.
+Database requirements:        PostgreSQL in production (see section 3).
+                              `asyncpg` and `psycopg2-binary` are already
+                              in `pyproject.toml`'s dependencies -- no
+                              package changes needed.
+Migration requirements:       Alembic, `database/migrations/`, 6 revisions
+                              (001-005 plus an index fix), all reviewed --
+                              see section 3.
+Persistent filesystem:       None required beyond the DB itself.
+                              `ml/models/` is read from disk
+                              (`model_path` setting) but is gitignored and
+                              optional (`/api/v1/model/` already reports
+                              "NO_MODEL_DEPLOYED" honestly when absent,
+                              per Phase 3's findings -- no ML model is
+                              deployed today). No other local file writes
+                              exist in the request path.
+Local-only assumptions:       None found that lack an env-var override.
+                              Every `localhost`/`127.0.0.1` occurrence in
+                              source is a DEFAULT value with a real env
+                              var override (`DATABASE_URL`, `REDIS_URL`,
+                              `API_CORS_ORIGINS`, `NEXT_PUBLIC_API_URL`) --
+                              grepped the full apps/services/database tree
+                              to confirm, excluding tests/docs/scratch
+                              scripts (which legitimately hit localhost
+                              during local development and are never
+                              deployed).
+Hardcoded ports:              8000 (backend) and 3000 (frontend dev) are
+                              defaults only, both overridable
+                              (`API_PORT`, and Vercel manages its own port
+                              entirely).
+Hardcoded URLs:               None outside of documented defaults and the
+                              real, intentional `https://public.coindcx.
+                              com` / `https://api.coindcx.com` /
+                              `wss://stream.coindcx.com` / `https://
+                              api.telegram.org` endpoints, which are
+                              correctly hardcoded (they are the real
+                              external services being integrated, not
+                              environment-specific).
+Development-only settings:   `app_debug: bool = True` is the DEFAULT --
+                              must be set to `false` in production (also
+                              controls SQLAlchemy's `echo=` verbosity, see
+                              `database/schema/__init__.py`). `docker-
+                              compose.yml`'s `api` service runs `--reload`
+                              and bind-mounts the whole repo -- this file
+                              is clearly a LOCAL DEV convenience compose
+                              (its own Postgres/Redis containers use dev
+                              passwords), not intended for direct
+                              production use; `infrastructure/Dockerfile.
+                              api` (built standalone, no `--reload`) is
+                              the production artifact.
+
+------------------------------------------------------------
+2. ENVIRONMENT VARIABLES -- PRODUCTION MATRIX
+------------------------------------------------------------
+
+(No actual secret values are shown anywhere below -- placeholders only.)
+
+| Variable                  | Purpose                                        | Req/Opt  | Side     | Secret? | Example placeholder |
+|----------------------------|------------------------------------------------|----------|----------|---------|----------------------|
+| APP_ENV                   | Environment label (development/production)     | Optional | Backend  | No      | production |
+| APP_DEBUG                 | SQLAlchemy echo + FastAPI debug verbosity       | Required | Backend  | No      | false |
+| APP_SECRET_KEY             | App-level secret (reserved; not yet used for signing anything security-critical) | Required | Backend | **Yes** | (32+ random chars) |
+| DATABASE_URL               | Async SQLAlchemy connection string             | Required | Backend  | **Yes** | postgresql+asyncpg://USER:PASS@HOST:5432/DBNAME |
+| DATABASE_URL_SYNC          | Sync connection string, used by Alembic only   | Required | Backend  | **Yes** | postgresql://USER:PASS@HOST:5432/DBNAME |
+| REDIS_URL                 | Reserved for future use (rate-limit/dedup); not required for current features | Optional | Backend | **Yes** (if used) | redis://HOST:6379/0 |
+| EXCHANGE_ID / _API_KEY / _API_SECRET / _TESTNET / _DEFAULT_MARKET | Reserved Binance research-data settings; no authenticated calls made anywhere in this codebase today | Optional | Backend | Yes (if ever populated) | (leave blank) |
+| COINDCX_API_KEY            | Real CoinDCX account read (balance/positions/trades) | Required for live monitoring | Backend | **Yes** | (from CoinDCX API settings) |
+| COINDCX_API_SECRET         | Signs CoinDCX requests                          | Required for live monitoring | Backend | **Yes** | (from CoinDCX API settings) |
+| SCHEDULER_ENABLED          | Turns on the background account-sync/signal/exit-alert loops | Optional (defaults false) | Backend | No | false until ready |
+| MARKET_DATA_WS_ENABLED     | Turns on the live public BTC/USDT WebSocket     | Optional (defaults false) | Backend | No | false until ready |
+| TELEGRAM_BOT_TOKEN         | Sends outbound alerts                           | Required for Telegram | Backend | **Yes** | (from @BotFather) |
+| TELEGRAM_CHAT_ID           | Destination chat for alerts                     | Required for Telegram | Backend | **Yes** (treat as sensitive -- identifies a real person's chat) | (numeric chat id) |
+| TELEGRAM_ENABLED           | Master on/off switch for all outbound Telegram sends | Optional (defaults false) | Backend | No | false until ready |
+| MODEL_PATH / MODEL_VERSION / PREDICTION_THRESHOLD | ML model location (no model is currently deployed -- Phase 3 found no robust edge) | Optional | Backend | No | ./ml/models |
+| RISK_PER_TRADE_PCT / MAX_DAILY_LOSS_PCT / MAX_DRAWDOWN_PCT / MAX_LEVERAGE / MAX_POSITIONS / MAX_DAILY_TRADES | Risk engine parameters -- unchanged this phase | Optional (sensible defaults) | Backend | No | (keep existing defaults) |
+| TRADING_MODE               | Label shown on dashboard (paper/backtest/testnet/live) | Optional | Backend | No | backtest |
+| API_HOST / API_PORT        | Bind address for uvicorn                        | Optional | Backend  | No      | 0.0.0.0 / 8000 |
+| API_CORS_ORIGINS           | Comma-separated allowed origins -- MUST be the real Vercel URL(s) in production, never `*` | Required | Backend | No | https://alphaone.vercel.app |
+| NEXT_PUBLIC_API_URL        | The backend's public HTTPS URL                  | Required | Frontend | No (public by design) | https://alphaone-api.up.railway.app |
+
+Verified:
+- `.env` (local, gitignored) contains real secret values; `.env.example`
+  contains only placeholders -- enforced by an automated test
+  (`tests/unit/test_env_example_hygiene.py`) that scans every
+  secret-shaped key name and fails if a real-looking value is found.
+- The frontend receives zero CoinDCX or Telegram variables anywhere --
+  grepped `apps/web` for every backend secret variable name; the only
+  match was documentation TEXT on the Settings page telling the user to
+  set them server-side, not an actual reference.
+- Production secrets never leave the backend process: verified via a
+  full repository secret scan (261 files) confirming every real secret
+  VALUE currently in `.env` appears nowhere else in the repository.
+
+------------------------------------------------------------
+3. DATABASE (POSTGRESQL) -- PASS, WITH AN HONEST CAVEAT
+------------------------------------------------------------
+
+Static review (all confirmed):
+- `database/schema/types.py`'s `GUID` TypeDecorator uses Postgres's native
+  `UUID` type when the dialect is `"postgresql"`, and a 32-char `CHAR` hex
+  string otherwise (SQLite) -- fully cross-dialect, no schema change
+  needed to switch databases.
+- Every partial unique index (`exchange_trade_id`,
+  `exchange_transaction_id`, migration 004) is declared with BOTH
+  `sqlite_where=` and `postgresql_where=` -- correct for both dialects.
+- `alembic/env.py` reads `settings.database_url_sync` (from the real
+  `Settings` object, which reads `DATABASE_URL_SYNC`) rather than a
+  hardcoded connection string -- pointing it at Postgres requires only
+  the env var, no code change.
+- `asyncpg>=0.29.0` and `psycopg2-binary>=2.9.9` are already declared
+  dependencies (confirmed installed: asyncpg 0.31.0, psycopg2 2.9.12 in
+  the local venv) -- no new packages needed for Postgres.
+- `create_async_engine(..., pool_size=5, max_overflow=10)` -- a real
+  connection pool is already configured (not the SQLite default of no
+  pooling); reasonable starting values for a small deployment.
+- Transaction handling: every DB-writing code path already uses
+  `async with async_session() as session: ... await session.commit()` --
+  standard SQLAlchemy async session-per-request/session-per-job pattern,
+  dialect-independent.
+
+**What could NOT be verified live in this sandbox**: no Docker is
+installed here, and the one local PostgreSQL 18 installation found on
+this machine requires a password this session does not have and should
+not attempt to guess or bypass. `alembic upgrade head` was therefore
+NOT run against a real reachable Postgres database in this session --
+compatibility is verified by static code review only, not a live
+migration run. This is the single most important item to actually
+execute (not just review) before the first real production deploy --
+see "DEPLOYMENT BLOCKERS".
+
+`DATABASE_URL` format (no credentials shown):
+`postgresql+asyncpg://<user>:<password>@<host>:<port>/<database>`
+`DATABASE_URL_SYNC` format: identical but without `+asyncpg` (used by
+Alembic, which needs a sync driver): `postgresql://<user>:<password>@
+<host>:<port>/<database>`.
+
+------------------------------------------------------------
+4. CORS -- PASS
+------------------------------------------------------------
+
+`apps/api/main.py` sets `allow_origins=settings.cors_origins`, which
+splits `API_CORS_ORIGINS` (default `http://localhost:3000`) on commas.
+Never `["*"]` anywhere in this codebase -- confirmed by reading the
+literal `CORSMiddleware` call. Production requirement: set
+`API_CORS_ORIGINS` to the real Vercel domain(s) before deploying --
+purely an env var change, no code change needed.
+
+------------------------------------------------------------
+5. FRONTEND CONFIGURATION -- PASS
+------------------------------------------------------------
+
+`apps/web/next.config.js` reads `NEXT_PUBLIC_API_URL` from the
+environment (falling back to `http://localhost:8000` only when unset).
+Ran the real production build with a placeholder production URL:
+
+  NEXT_PUBLIC_API_URL="https://api.example-placeholder.invalid" npm run build
+
+Build succeeded cleanly (0 errors), all 10 routes prerendered as static
+content. Verified by directly inspecting the compiled output bundle
+(`.next/static/chunks/app/dashboard/*.js`) that the placeholder
+production URL was actually baked into the client JavaScript
+(`let x="https://api.example-placeholder.invalid"`) -- not just trusting
+the build log, and confirming Next.js's real env-var precedence (a
+build-time environment variable overrides `.env.local`'s default)
+actually works as expected in this project. No `localhost` reference
+survived into the compiled bundle when the env var was set. Not deployed.
+
+------------------------------------------------------------
+6. BACKEND PRODUCTION STARTUP -- PASS
+------------------------------------------------------------
+
+Production command: `uvicorn apps.api.main:app --host 0.0.0.0 --port
+8000` (no `--reload`). Real-tested multiple times this project (most
+recently in the prior "Live Market Data Production Hardening" phase):
+DB tables created via `Base.metadata.create_all` on startup, scheduler
+starts when enabled, market-data WebSocket starts (with its startup-retry
+supervisor) when enabled, and `lifespan`'s shutdown path stops the
+scheduler and disconnects the WebSocket cleanly (`await scheduler.stop()`
+/ `await stop_market_data_ws()`) before `engine.dispose()`. Verified via
+a real restart in this session's earlier phases -- see section 8.
+
+------------------------------------------------------------
+7. HEALTH CHECKS -- PASS
+------------------------------------------------------------
+
+Two endpoints, deliberately different purposes:
+- `GET /health` -- **liveness**. No dependency checks at all; returns
+  `{"status":"ok","service":"alphaone","version":"0.1.0"}` unconditionally
+  if the process is up. Use for a restart-on-failure probe.
+- `GET /ready` (identical logic also at `GET /api/v1/health/`) --
+  **readiness**. Calls `compute_readiness()`
+  (`apps/api/routers/health.py`), which checks real DB connectivity
+  (`SELECT 1`) and CoinDCX reachability, returning ONLY coarse status
+  strings (`"ok"`/`"error"`/`"NOT_CONFIGURED"`/etc.) -- verified by
+  reading the function line-by-line that it never returns a credential,
+  connection string, or account balance. Use for a load-balancer
+  traffic-routing probe.
+Both endpoints already existed before this audit (built in an earlier
+phase); this audit verified their behavior and documented the intended
+liveness/readiness distinction, without changing either endpoint's code.
+
+------------------------------------------------------------
+8. PROCESS RESTART -- PASS
+------------------------------------------------------------
+
+Already directly, repeatedly verified with a REAL backend process across
+this project's recent phases (not simulated):
+- Database reconnects: `Base.metadata.create_all` + a fresh
+  `async_session()` on every request -- no persistent connection state to
+  go stale across a restart.
+- Scheduler starts correctly with no duplicate jobs: `SchedulerRunner.
+  start()` guards `if self._running: return` and creates exactly 4 tasks
+  once.
+- Startup WebSocket retry supervisor starts, connects, no duplicate
+  subscriptions: real-tested in the "Production Hardening" phase --
+  restarted the backend, observed `attempt=1` in the log (confirming the
+  new supervisor code path, not a bypass), real LIVE market data within
+  seconds, zero exceptions.
+- No duplicate Telegram alerts across a restart: the connection-transition
+  dedup lives in the WebSocket client's own in-memory
+  `_last_notified_status`, which is naturally reset (to a fresh baseline,
+  not a stale "already notified" state) on every process restart -- the
+  first connect after any restart is always correctly treated as a
+  baseline, never a spurious "RECOVERED" alert.
+Do NOT enable automatic trading -- none exists; unaffected by any of the
+above.
+
+------------------------------------------------------------
+9. LOGGING -- PASS
+------------------------------------------------------------
+
+Grepped the entire `apps`/`services`/`database` tree for any `print()` of
+a credential-bearing object in the CoinDCX/Telegram/config modules --
+none found. `structlog` is used throughout with structured `key=value`
+fields, never string-interpolating a raw settings object. No
+`structlog.configure()` call exists anywhere (uses structlog's sane
+built-in default renderer) -- functionally safe, but worth explicitly
+configuring a JSON renderer if the chosen host's log aggregation prefers
+structured JSON over key=value text; not a blocker, noted as an optional
+follow-up. `DATABASE_URL`'s embedded password is never logged anywhere
+(grepped for `database_url`/`DATABASE_URL` usage -- only ever passed
+directly to `create_async_engine`/Alembic, never printed or logged).
+
+------------------------------------------------------------
+10. TIME / TIMEZONE -- PASS
+------------------------------------------------------------
+
+Grepped the entire `apps`/`services`/`database` tree for `datetime.now()`
+(local/naive-local time) -- zero occurrences in production code; every
+timestamp is `datetime.utcnow()` (naive-UTC, consistent throughout the
+whole schema). The frontend already has a dedicated compensating helper
+(`apps/web/lib/time.ts: parseUtcDate`) that appends `Z` to any naive-UTC
+ISO string before parsing, specifically because JavaScript's `Date`
+constructor otherwise silently parses a bare (no-timezone-suffix) ISO
+string as local time -- applied everywhere a backend timestamp reaches
+the UI. The scheduler's interval loops (`asyncio.sleep(seconds)`) are
+wall-clock-duration-based, not tied to any calendar/timezone concept, so
+they are inherently timezone-safe regardless of the host machine's local
+timezone.
+
+------------------------------------------------------------
+11. WEBSOCKET DEPLOYMENT -- PASS
+------------------------------------------------------------
+
+Already real-tested extensively in prior phases of this project, not
+re-tested from scratch in this audit (per "do not change trading logic /
+do not rewrite completed work" and this phase's own scope of
+configuration/infrastructure only):
+- Initial startup retry: real-tested (mocked backoff timing, 9 dedicated
+  tests; real happy-path restart confirmed `attempt=1` logging).
+- Existing reconnect: real-tested against a genuine induced transport
+  drop (DISCONNECTED -> automatic reconnect -> LIVE in ~2s, no duplicate
+  subscriptions).
+- Heartbeat: the documented CoinDCX ping-every-25s pattern, implemented
+  and never timed out during a real 30-minute soak.
+- Stale detection: LIVE/STALE/DISCONNECTED/UNAVAILABLE state machine,
+  unit-tested and real-soak-tested.
+- Graceful shutdown: `stop_market_data_ws()` stops the retry supervisor
+  and disconnects the socket cleanly, called from `lifespan`'s shutdown
+  path.
+Confirmed for THIS audit specifically: the WebSocket only ever runs
+inside `apps/api/main.py`'s `lifespan` (a persistent backend process) --
+never inside `apps/web` (the Vercel frontend), which has no WebSocket
+code at all. Grepped `apps/web` for any `socket.io`/`WebSocket`
+reference -- none exist.
+
+------------------------------------------------------------
+12. TELEGRAM -- PASS
+------------------------------------------------------------
+
+`TELEGRAM_ENABLED`/`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` all read from
+`Settings` (env vars), never hardcoded. No test message was sent during
+this audit (none was needed -- real delivery was already proven working
+in an earlier phase with a real `message_id`, and this phase changed
+nothing about the Telegram integration). Credentials confirmed
+server-side only (section 2's repo-wide secret scan covers
+`TELEGRAM_BOT_TOKEN` explicitly).
+
+------------------------------------------------------------
+13. COINDCX -- PASS
+------------------------------------------------------------
+
+`COINDCX_API_KEY`/`COINDCX_API_SECRET` read from `Settings` only, never
+referenced in `apps/web` (section 2). No order-placing/cancelling/
+modifying/leverage-changing/transferring/withdrawing endpoint exists
+anywhere in this codebase -- enforced by
+`tests/unit/test_no_order_placement_capability.py`, which introspects
+every exchange-related class (including the market-data WebSocket and its
+startup-retry supervisor) by method name, not just by not calling
+anything. No new CoinDCX permission or endpoint was requested or added in
+this audit.
+
+------------------------------------------------------------
+14. DOCKER -- PASS (exists; one is dev-only, one is production-appropriate)
+------------------------------------------------------------
+
+- `infrastructure/Dockerfile.api`: production-appropriate as-is (no
+  `--reload`, no bind-mounted source, installs the real system deps for
+  `psycopg2-binary`). One caveat: pins `python:3.11-slim`, an untested
+  combination (see section 1 and "DEPLOYMENT BLOCKERS") -- not changed in
+  this audit, since verifying it requires actually building the image
+  (no Docker available here) and blindly changing an untested pin to
+  another untested pin would not be an improvement.
+- `docker-compose.yml`: a LOCAL DEV convenience file (dev Postgres/Redis
+  passwords, `--reload`, bind-mounted source) -- not intended for direct
+  production use, and not changed in this audit.
+- Docker is NOT required for the recommended hosting option (Railway can
+  deploy directly from the Dockerfile OR via Nixpacks auto-detection from
+  `pyproject.toml` -- either works; see section 17). No new
+  Docker/compose file was created, since the existing one is already
+  adequate for whichever path is chosen.
+Not deployed.
+
+------------------------------------------------------------
+15. SECURITY -- PASS
+------------------------------------------------------------
+
+- Secret scan: 261 files scanned, every real secret value in `.env`
+  confirmed to appear nowhere else in the repository.
+- No-order-capability suite: 6/6 passed (`test_no_order_placement_
+  capability.py`), including checks specific to the market-data WebSocket
+  and its startup-retry supervisor added in the prior phase.
+- Credential-logging suite: 3/3 passed
+  (`test_coindcx_no_credential_logging.py`).
+- CORS: verified never `*` (section 4).
+- Environment validation: `.env.example` contains only placeholders,
+  enforced by an automated structural test
+  (`test_env_example_hygiene.py`), not just manual inspection.
+
+------------------------------------------------------------
+16. PRODUCTION BUILD TEST -- EXACT RESULTS
+------------------------------------------------------------
+
+Backend test suite:      440 passed, 1 skipped, 0 failed
+Frontend test suite:     16 passed, 0 failed
+TypeScript compilation:  clean, 0 errors (`tsc --noEmit`)
+Frontend production build: succeeded, 10/10 routes prerendered, real
+                           production API URL correctly baked into the
+                           compiled bundle (verified directly, not just
+                           via the build log)
+Database migration validation: NOT run live against a real Postgres in
+                           this sandbox (no Docker; the one local
+                           Postgres found requires credentials this
+                           session doesn't have) -- static review only
+                           (see section 3). This is the one "PASS" in
+                           this report that rests on code review rather
+                           than an executed run; flagged plainly rather
+                           than glossed over.
+ESLint:                   not configured in this project (no
+                           `.eslintrc*` file) -- `next lint` would prompt
+                           interactively to create one; pre-existing, not
+                           introduced by this audit, not run.
+
+------------------------------------------------------------
+17. HOSTING RECOMMENDATION
+------------------------------------------------------------
+
+Requirements recap: always-on process, WebSocket support (outbound to
+CoinDCX, not inbound), background scheduler, Python/FastAPI, environment
+secrets, HTTPS, automatic restart, reasonable cost, suitable for a
+student project.
+
+| Option | Always-on | WebSocket-friendly | Managed Postgres | Cost for this workload | Verdict |
+|---|---|---|---|---|---|
+| **Railway** | Yes | Yes (no idle-sleep on paid usage-based plan) | Yes, one-click, same project | Usage-based; a single small always-on FastAPI service + a small Postgres instance is typically a few dollars/month, often coverable by trial credit for a while | **Recommended** -- simplest path from this exact repo (Dockerfile or Nixpacks both work), Postgres and the API live in the same project, secrets UI, auto HTTPS on a generated domain |
+| **Render** | Only on a PAID web service | Yes, but the FREE tier spins down after ~15 min idle -- this would silently kill the persistent CoinDCX WebSocket and lose scheduler state between requests | Yes, managed Postgres add-on | Free tier unsuitable for this app specifically; paid tier (~$7/mo+) works fine | Good alternative only on a paid plan -- explicitly avoid the free tier for this app |
+| **Fly.io** | Yes (small persistent VM/"machine") | Yes | Yes (Fly Postgres or an external managed Postgres) | Low, but requires more manual configuration (`fly.toml`, volumes) than Railway for an equivalent result | Solid alternative if comfortable with a bit more DevOps setup |
+| **A plain VPS** (DigitalOcean/Hetzner) | Yes | Yes | Self-managed (more ops burden) | Cheapest raw compute, but you own patching/monitoring/TLS (though Caddy/Nginx + Let's Encrypt make TLS easy) | Most control, most manual maintenance -- reasonable if already comfortable with basic Linux server administration |
+| Vercel serverless functions (for the backend too) | No | No -- functions don't hold a persistent outbound connection | N/A | N/A | **Explicitly ruled out** -- would kill the scheduler and WebSocket the moment a function instance recycles, exactly the failure mode `docs/deployment.md` has warned about since Phase 4 |
+
+**Recommendation: Railway** for the backend, Vercel for the frontend
+(as already planned). Reason: the lowest setup friction for exactly this
+repo's shape (one Dockerfile, one FastAPI process, one Postgres database,
+all always-on), a real managed Postgres in the same place, and no
+idle-sleep trap that would silently break the live WebSocket/scheduler --
+the single failure mode most likely to bite a first-time deploy of this
+specific app. Fly.io is a reasonable second choice for a slightly cheaper
+long-term steady-state cost if the extra manual configuration is
+acceptable.
+
+------------------------------------------------------------
+18. DEPLOYMENT RUNBOOK
+------------------------------------------------------------
+
+1. **PostgreSQL**
+   - Provision a Postgres instance (Railway's managed Postgres, or Fly
+     Postgres, or any managed provider).
+   - Note its connection details; construct both `DATABASE_URL`
+     (`postgresql+asyncpg://...`) and `DATABASE_URL_SYNC`
+     (`postgresql://...`, same credentials, no `+asyncpg`).
+
+2. **Backend**
+   - Push this repository to the chosen host (Railway: connect the GitHub
+     repo; it will detect `infrastructure/Dockerfile.api` or build via
+     Nixpacks from `pyproject.toml` -- either works).
+   - Do not enable `SCHEDULER_ENABLED` or `MARKET_DATA_WS_ENABLED` yet.
+
+3. **Environment variables**
+   - Set every variable in section 2's matrix on the backend service.
+   - Set `APP_DEBUG=false`, `APP_ENV=production`.
+   - Set `API_CORS_ORIGINS` to the (not-yet-deployed) Vercel URL you plan
+     to use -- Vercel assigns a predictable `*.vercel.app` URL before
+     first deploy, or use your custom domain if already known.
+   - Leave `SCHEDULER_ENABLED=false`, `MARKET_DATA_WS_ENABLED=false`,
+     `TELEGRAM_ENABLED=false` for this first pass.
+
+4. **Database migrations**
+   - From a shell with `DATABASE_URL_SYNC` pointed at the real production
+     Postgres (e.g. Railway's one-off run command, or a local shell with
+     the env var exported), run: `alembic upgrade head`
+   - Confirm it completes with no errors and creates all tables. This is
+     the one step this audit could not execute live (see section 3) --
+     do not skip actually watching this succeed.
+
+5. **Backend health verification**
+   - `curl https://<backend-host>/health` -> expect
+     `{"status":"ok",...}`.
+   - `curl https://<backend-host>/ready` -> expect
+     `{"status":"ok","services":{"database":"ok","coindcx_account":
+     "NOT_CONFIGURED"}}` (NOT_CONFIGURED is correct/expected until step 7).
+
+6. **Telegram verification**
+   - Set `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, then `TELEGRAM_ENABLED=
+     true`. Do not send a test message automatically -- if you want one,
+     trigger it manually via `scripts/telegram_connectivity_test.py` (or
+     an equivalent manual check) exactly once, watching for a real
+     delivered `message_id`.
+
+7. **CoinDCX verification**
+   - Set `COINDCX_API_KEY`/`COINDCX_API_SECRET`.
+   - `curl https://<backend-host>/ready` again -> `coindcx_account` should
+     now report a real status (e.g. `"OK"`).
+   - Manually hit `/api/v1/accounts/balance` once and confirm it shows
+     the real account balance -- do NOT enable the scheduler yet.
+
+8. **WebSocket verification**
+   - Set `MARKET_DATA_WS_ENABLED=true`, restart the service.
+   - Check startup logs for `CoinDCX market-data WebSocket connected` and
+     `attempt=1` (or a small retry count, which is fine and expected
+     behavior, not a failure).
+   - `curl https://<backend-host>/api/v1/dashboard/` -> confirm
+     `market_data_status: "LIVE"` and a real `btc_price_inr`.
+
+9. **Vercel frontend**
+   - Import the repo into Vercel, set the project root to `apps/web`.
+   - Set `NEXT_PUBLIC_API_URL` to the real backend HTTPS URL from step 2.
+   - Deploy. Confirm the dashboard loads and shows real data from the
+     backend (not "Failed to fetch").
+   - If the backend's URL differs from what you set in step 3's
+     `API_CORS_ORIGINS`, update it there and restart the backend.
+
+10. **Production end-to-end test**
+    - Open the deployed Vercel URL in a browser; confirm the dashboard,
+      chart, signals, trades, performance, risk, and settings pages all
+      load real data with no console errors and no `$`/USD anywhere.
+    - Only once everything above is confirmed working with
+      `SCHEDULER_ENABLED=false`, consider enabling
+      `SCHEDULER_ENABLED=true` for live monitoring -- per every prior
+      phase's rule, this must remain monitoring/alerting only; no code
+      path in this repository is capable of placing a real order.
+
+============================================================
+DEPLOYMENT BLOCKERS (must close out, not just note, before first deploy)
+============================================================
+
+1. Run `alembic upgrade head` against a REAL, reachable Postgres at least
+   once and watch it succeed -- this audit verified compatibility by
+   static review only (no Docker, no accessible local Postgres
+   credentials in this sandbox).
+2. Build `infrastructure/Dockerfile.api` and run the full test suite
+   inside the built image at least once -- this project's tests have only
+   ever been executed against Python 3.14 locally, never the 3.11 the
+   Dockerfile pins (both satisfy `pyproject.toml`'s stated floor, but the
+   exact combination is unverified).
+3. Set real production values for `API_CORS_ORIGINS` and
+   `NEXT_PUBLIC_API_URL` once both real hosting URLs are known (they
+   don't exist yet since nothing is deployed).
+
+Everything else audited above is either already passing with real
+evidence, or is optional/non-blocking and explicitly labeled as such.
+
+============================================================
+DONE. Stopping here as instructed.
+DO NOT DEPLOY. DO NOT ENABLE PRODUCTION SCHEDULER OR TELEGRAM.
+DO NOT CREATE EXCHANGE ORDERS. DO NOT MODIFY POSITIONS.
+DO NOT CHANGE TRADING LOGIC.
+============================================================

@@ -1,0 +1,275 @@
+============================================================
+ALPHAONE AI
+PHASE 4 FINAL REPORT: MANUAL TRADING INTELLIGENCE +
+SUNCRYPTO TRACKING + TELEGRAM
+============================================================
+
+1. EXECUTIVE SUMMARY
+------------------------------------------------------------
+Phases 1-3 built and honestly validated a BTC/USDT research pipeline;
+Phase 3's conclusion (unchanged by this phase) was that no baseline or ML
+model demonstrated a robust, cost-surviving out-of-sample edge. The user
+then clarified the real product goal: AlphaOne is not an automatic
+trading bot. It is decision support + trade tracking + analytics for a
+user who executes every trade manually on SunCrypto. Phase 4 built that
+product: a database schema for accounts/trades/signals/deposits, a
+manual trade journal with partial-exit support, a portfolio-accounting
+layer that keeps three performance views strictly separate, a real
+dashboard (7 pages, all wired to live data), a Telegram bot (12 commands,
+tested against mocks per the user's choice), an exchange-agnostic
+provider architecture with a SunCrypto implementation, signal-to-trade
+matching, position-exit alerting, and a signal-outcome evaluator. Test
+suite grew from 200 (end of Phase 3) to 281 passed / 0 failed / 0
+skipped. Every page and endpoint was manually verified end-to-end in a
+real browser against the real research database, not just unit-tested.
+
+2. PRODUCT SCOPE CHANGE
+------------------------------------------------------------
+Prior phases treated "does AlphaOne have a trading edge" as the open
+question. Phase 4 does not attempt to answer that differently -- it
+changes what AlphaOne IS. New absolute constraint, enforced
+architecturally rather than by convention: AlphaOne can never place,
+cancel, or modify an order, or change leverage. See section 3.
+
+3. ABSOLUTE SAFETY ARCHITECTURE
+------------------------------------------------------------
+`services/exchange/base.py` defines two interfaces: `ExchangeMarketDataProvider`
+(public data) and `ExchangeAccountProvider` (read-only account access --
+every method must be named `get_*`). `tests/unit/test_no_order_placement_capability.py`
+introspects every exchange class in the codebase (currently
+`SunCryptoMarketDataProvider`, `SunCryptoReadOnlyAccountProvider`, and
+both interfaces) against a blacklist of order/cancel/modify/leverage/
+margin-mutation terms, AND a whitelist check that every account-provider
+method starts with `get_`. This test is designed to keep failing loudly
+if anyone ever adds a mutating method -- it is not a one-time check, it
+runs in the suite every time. Nothing in this codebase places an order.
+
+4. SUNCRYPTO API RESEARCH FINDINGS
+------------------------------------------------------------
+Investigated before writing any integration code, per the spec's own
+instruction not to assume undocumented endpoints exist. Fetched both
+docs.suncrypto.in and help.suncrypto.in. Finding: SunCrypto's only
+documented API is 3 unauthenticated PUBLIC SPOT endpoints (`GET
+/public/pairs`, `GET /public/tickers`, `GET /public/historical_trades`).
+No futures API, no authenticated account access, no order endpoints, no
+documented API-key permission granularity anywhere. This triggered the
+spec's own explicit fallback: manual trade tracking, not live account
+sync. `SunCryptoMarketDataProvider` (services/exchange/suncrypto.py)
+makes real calls to the 3 documented endpoints (verified against a
+mocked HTTP transport, tests/unit/test_suncrypto_market_data.py).
+`SunCryptoReadOnlyAccountProvider` is an honest stub -- every method
+reports UNAVAILABLE, never a fabricated balance or position.
+
+5. DATABASE SCHEMA CHANGES
+------------------------------------------------------------
+Migration 003 (database/migrations/versions/003_phase4_manual_trading.py).
+New tables: accounts, account_snapshots, deposits, withdrawals,
+trade_executions, signal_outcomes, sync_events. Extended `signals` with
+quality/strategy_name/model_version; extended `trades` with
+is_manual_entry/source/matched_signal_confidence/account_id (FK). All
+existing Phase 1-3 tables (candles, features, funding_rates, backtest_runs,
+etc.) untouched. Applied cleanly to the local SQLite dev DB (one real bug
+found and fixed along the way: SQLite doesn't support `ALTER TABLE ADD
+CONSTRAINT` outside batch mode -- fixed with `op.batch_alter_table`).
+`database/schema/types.py`'s cross-dialect `GUID` type (from Phase 2)
+means this migration will apply to Postgres unchanged.
+
+6. BACKEND SERVICES BUILT
+------------------------------------------------------------
+- services/trade_journal/ -- open/exit (full+partial)/cancel/match manual
+  trades, DB-persisted (unlike the Phase 1 in-memory-only PaperTrader,
+  whose PnL/fee/R-multiple math was extracted into
+  services/trade_journal/pnl.py and is now shared by both).
+- services/portfolio/ -- the three-way performance split, equity curve
+  (excludes deposits/withdrawals), P&L breakdown (gross/fees/funding/net,
+  daily/weekly/monthly), missed-signal stats, reconciliation (flags
+  mismatches, never auto-corrects).
+- services/signal_engine/strategy.py -- pluggable SignalStrategy
+  (BaselineStrategy/MLStrategy/FutureStrategy); quality.py -- categorical
+  LOW/MEDIUM/HIGH bucketing from a real number, never a fabricated score.
+- services/signal_engine/live_signal.py -- on-demand signal generation
+  from real candles, persists Signal + SignalOutcome(PENDING).
+- services/signal_engine/outcome_evaluator.py -- resolves PENDING
+  outcomes to WIN/LOSS/EXPIRED against real subsequent candles.
+- services/signal_matching/matcher.py -- symbol+direction+time+price
+  proximity matching; ambiguous ties are never auto-picked.
+- services/position_monitor/monitor.py -- recommends (never executes) an
+  exit when an open position's own SL/TP would have been hit; deduped via
+  NotificationLog.
+- services/exchange/ -- provider interfaces, SunCrypto implementation,
+  sync scaffold with an honest audit trail (SyncEvent).
+- services/risk_engine/state_store.py -- persists the Phase 2.6
+  RiskEngine's state to BotState so the risk dashboard survives across
+  stateless API requests; fed by each closed manual trade's
+  equity-relative PnL, same convention as the Phase 2.6 backtester fix.
+
+7. API ENDPOINTS
+------------------------------------------------------------
+Every previously-stubbed router (dashboard, signals, trades, performance,
+model, risk, settings, health) now queries the real DB / calls the real
+engines -- confirmed via a fresh audit that these were 100% hardcoded
+stubs before this phase. New routers: accounts (connection status,
+snapshots, deposits, withdrawals, reconcile, sync/sync-status), journal
+(open/exit/cancel/match-candidates/confirm-match/exit-alerts), portfolio
+(performance/missed-signals/equity-curve/pnl-breakdown), market
+(candles + signal markers for the chart).
+
+8. FRONTEND DASHBOARD
+------------------------------------------------------------
+All 8 pages wired to real data, extending (not replacing) the existing
+dark "trading terminal" design system already in place
+(globals.css/tailwind.config.ts/Navigation/DashboardCard). Chart page now
+renders real BTC/USDT candlesticks via `lightweight-charts` (previously
+installed but unused) with signal markers overlaid. Every missing/
+unavailable value renders "N/A" or "Not Connected" -- never a fabricated
+zero or placeholder number (verified in-browser: unrealized P&L shows
+N/A, account status shows "Manual Tracking", price source shows
+STALE/UNAVAILABLE honestly). Manual trade entry/exit forms tested
+end-to-end in a real browser against the real research DB. One real bug
+found and fixed during manual verification: the chart container was
+`display:none` while loading, so `lightweight-charts` measured 0 width at
+creation time and rendered nothing -- fixed by keeping the container
+visible and overlaying the loading skeleton instead. A second bug found
+the same way: the Performance page ran the Backtest view's `win_rate`
+(stored 0-100, Phase 2 BacktestMetric convention) through the same
+percentage formatter as the 0-1-fraction fields from the other two views,
+showing "1818.0%" -- fixed in the frontend formatting, not the backtester
+(which is correct and tested as-is).
+
+9. TELEGRAM BOT
+------------------------------------------------------------
+Rewired from 10 static-text stub handlers (confirmed inert -- never
+instantiated, no polling ever started) to 12 real command handlers
+(/start /help /status /account /signal /position /trades /performance
+/today /risk /pause /resume), all reading real DB state through the same
+services the API uses. Outbound alert formatters (send_signal, send_exit,
+send_exit_alert, send_kill_switch) are real and functional but gated
+behind TELEGRAM_ENABLED. Per the user's explicit choice, this was built
+and tested entirely against mocks (tests/unit/test_telegram_bot.py, 9
+tests, mocked Update/Bot + real in-memory DB) -- no live Telegram
+connection was attempted. Going live needs only a real BOT_TOKEN/CHAT_ID
+in .env; no code changes.
+
+10. RISK DASHBOARD INTEGRATION
+------------------------------------------------------------
+Reuses the Phase 2.6 RiskEngine/RiskStatus verbatim -- no second risk
+model was built. Verified end-to-end in-browser: a real closed manual
+trade correctly updated current_equity/daily_pnl/trades_today, and a
+scripted catastrophic loss correctly tripped HARD_KILL, which then
+required the explicit reset-hard-kill action to clear (manual-only reset
+semantics preserved from Phase 2.6).
+
+11. SIGNAL GENERATION & STRATEGY ABSTRACTION
+------------------------------------------------------------
+The originally-requested pluggable SignalStrategy (BaselineStrategy/
+MLStrategy/FutureStrategy) was built. BaselineStrategy wraps the real,
+tested Donchian+ADX rule (Phase 2.6's strongest, still-unverified
+baseline) and is the only one wired into the live /signals/generate
+endpoint. Its `quality` field is derived from the real ADX margin above
+its firing threshold -- never a fabricated confidence number for a
+rule-based strategy that doesn't produce one. MLStrategy wraps the Phase
+3 calibrated-model contract but is not used by any default endpoint,
+consistent with Phase 3's finding that no model showed a validated edge.
+Verified in-browser: clicking "Check Latest Signal" against the real
+research DB produced a real NO_TRADE signal with regime UNCERTAIN and a
+reasoning string quoting the Phase 2.6 walk-forward numbers.
+
+12. MANUAL TRADE TRACKING & SIGNAL MATCHING
+------------------------------------------------------------
+Full open/partial-exit/full-exit/cancel lifecycle, verified in-browser
+with a real trade (LONG 0.01 BTC @ 79000 -> 81000, $19.36 net after fees,
+R=0.65 -- hand-checked against services/trade_journal/pnl.py's formulas
+and confirmed exact). Signal-to-trade matching auto-links a confident
+single candidate on trade open; two close candidates return as
+`match_candidates` for manual confirmation via a real endpoint
+(POST /journal/{trade_id}/confirm-match) rather than being guessed.
+
+13. POSITION MONITORING & EXIT ALERTS
+------------------------------------------------------------
+Addresses a gap identified as far back as the Phase 1 audit: SignalEngine
+never produced an EXIT signal at all. `services/position_monitor` now
+checks open manual positions against the latest real candle price and
+recommends (never executes) an exit when the position's own stop or
+target would have been hit, with Telegram alerting and NotificationLog-
+based dedup so a standing breach isn't repeated on every check.
+
+14. THREE-WAY PERFORMANCE SEPARATION
+------------------------------------------------------------
+The most safety-critical accounting rule in this phase. GET
+/api/v1/portfolio/performance returns backtest / alphaone_signals /
+user_actual as three independent top-level keys, sourced from three
+different tables (BacktestMetric / SignalOutcome / Trade respectively),
+verified in-browser with real data: a $19.36 real trade, a NO_TRADE
+signal, and the real Phase 2 EMA-crossover backtest (-7.19%) all
+displayed simultaneously without ever being summed or blended.
+
+15. TESTING SUMMARY
+------------------------------------------------------------
+200 (end of Phase 3) -> 281 passed, 0 failed, 0 skipped. New test files
+include: test_phase4_models, test_trade_journal, test_portfolio_service,
+test_risk_engine_state_store, test_signal_quality, test_signal_strategy,
+test_live_signal, test_telegram_bot, test_no_order_placement_capability
+(the explicit security test), test_suncrypto_market_data,
+test_exchange_sync, test_signal_matching, test_position_monitor,
+test_outcome_evaluator, test_no_forbidden_financial_claims (scans actual
+source files for banned phrases), and an end-to-end API integration
+suite (test_api_phase4_flow.py, 8 tests against a real FastAPI app +
+in-memory DB, never the real research DB). Beyond automated tests, every
+frontend page and the full open->exit->risk->performance flow was
+manually driven in a real browser against the real research database.
+
+16. KNOWN LIMITATIONS & GAPS
+------------------------------------------------------------
+Documented in full in docs/known_limitations.md (Phase 4 section). In
+brief: no live price/tick feed (dashboard and exit-alerts use the latest
+already-ingested candle, honestly labeled STALE/UNAVAILABLE); no
+unrealized P&L for open positions (no live feed to mark against); no
+background scheduler drives signal generation, outcome evaluation, or
+exit-alert checks automatically -- all three are on-demand endpoints
+today, though the state a scheduler would need (the pause flag, dedup
+log) already exists and is tested; Telegram tested against mocks only;
+the ambiguous signal-match confirmation has a real, tested backend
+contract but no dedicated frontend picker yet; no dedicated audit-log
+table (SyncEvent + NotificationLog cover the events that actually occur
+this phase); nothing has been deployed to production.
+
+17. DEPLOYMENT GUIDANCE
+------------------------------------------------------------
+Full detail in docs/deployment.md. Summary: Vercel for the frontend; a
+persistent (non-serverless) backend process for the Telegram poller and
+any future scheduled jobs; Postgres in production (the GUID type already
+supports this with no schema changes); Redis reserved for future
+rate-limiting/dedup at higher volume. Every secret (DATABASE_URL,
+TELEGRAM_BOT_TOKEN, exchange keys if ever populated) must be a
+server-side env var, never NEXT_PUBLIC_*. Nothing has actually been
+deployed.
+
+18. FINAL ACCEPTANCE CHECKLIST & NEXT STEPS
+------------------------------------------------------------
+[x] AlphaOne cannot place/cancel/modify orders (enforced by test, not
+    just policy)
+[x] SunCrypto's real API investigated before implementation; honest
+    fallback to manual tracking
+[x] API keys/secrets never exposed client-side (none exist yet, but the
+    rule is documented and none of this phase's code violates it)
+[x] Backtest / AlphaOne signal / user actual performance kept separate
+    everywhere, verified live
+[x] No fabricated account values, prices, or signals anywhere -- N/A and
+    "Not Connected" render honestly, verified in-browser
+[x] Categorical LOW/MEDIUM/HIGH signal quality, never a fabricated
+    confidence percentage
+[x] EXIT/NO_TRADE states only ever recommend, never execute
+[x] Deposits/withdrawals excluded from trading P&L and the equity curve
+[x] Risk dashboard reuses the existing Phase 2.6 RiskEngine, not a new one
+[x] Full test suite green (281/281), plus manual end-to-end browser
+    verification
+[x] No forbidden financial-claim language anywhere (scanned by test)
+[ ] Live scheduler for signal generation / exit checks / outcome
+    evaluation -- deliberately out of scope this phase (see section 16)
+[ ] Live Telegram connection -- deliberately deferred per the user's
+    explicit choice this session
+[ ] Production deployment -- not performed
+
+Per the user's explicit closing instruction: this phase's implementation
+and report are complete. Stopping here -- no further phase begins
+automatically.

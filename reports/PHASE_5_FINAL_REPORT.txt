@@ -1,0 +1,391 @@
+============================================================
+ALPHAONE AI
+PHASE 5 FINAL REPORT
+COINDCX READ-ONLY + LIVE MONITORING
+============================================================
+
+1. PHASE 4 COMPONENTS REUSED
+------------------------------------------------------------
+Nothing from Phase 4 was rebuilt. Reused as-is: the exchange-agnostic
+interfaces (services/exchange/base.py -- ExchangeMarketDataProvider /
+ExchangeAccountProvider), the manual trade journal
+(services/trade_journal/journal.py -- open/partial-exit/exit/cancel,
+including record_exit, which the new CoinDCX position-close logic calls
+directly rather than duplicating), the portfolio service's three-way
+performance separation (services/portfolio/service.py), the signal
+matcher (services/signal_matching/matcher.py -- used unmodified for both
+manually-entered trades AND newly-detected CoinDCX positions), the
+Phase 2.6 RiskEngine and its state_store persistence, the position
+monitor's exit-recommendation logic (services/position_monitor/monitor.py,
+extended with real symbol/entry_price/pnl fields rather than rewritten),
+the Telegram bot's command/handler architecture (12 commands preserved,
+handlers updated to real CoinDCX data), and the dashboard/API/frontend
+skeleton (routers and pages extended, not replaced). The SunCrypto
+provider (services/exchange/suncrypto.py) is kept, untouched, as
+historical/reference code -- it is no longer the active exchange but
+remains a working example of the ExchangeAccountProvider interface.
+
+2. COINDCX OFFICIAL API CAPABILITIES
+------------------------------------------------------------
+Researched directly from https://docs.coindcx.com/ (a single long-scroll
+"Slate" documentation page; the Futures End Points section alone is
+~85,000 characters of endpoint definitions and real code samples) --
+never from tutorials, blog posts, or third-party GitHub repos for
+capability decisions, per the brief. Full findings recorded in
+docs/coindcx_api_findings.md. Summary:
+- Public market data: active-instruments list, per-instrument details,
+  recent trades, a real-time current/mark-price feed for ALL pairs in one
+  call, REST candlesticks (CoinDCX's own docs recommend the WebSocket
+  instead for anything time-sensitive), pair stats.
+- Authenticated reads: futures wallet balance, wallet transaction ledger,
+  list/filter open positions (by page or by pair/position-id), position-
+  level realized-PnL/funding transactions (filterable by stage: default/
+  funding/exit/tpsl_exit/liquidation), trade fill history (mandatory
+  date-range), list orders (mandatory single-valued side -- buy/sell
+  queried separately for a full list).
+- A documented WebSocket API (Socket.IO protocol, not raw websockets)
+  with both public market-data channels and an authenticated "coindcx"
+  channel streaming df-position-update / df-order-update / balance-update.
+- Mutating endpoints exist and are documented (create/cancel/edit order,
+  update leverage, add/remove margin, exit position, create TP/SL, change
+  margin type, wallet transfer) -- see section 4.
+
+3. AUTHENTICATION
+------------------------------------------------------------
+Headers X-AUTH-APIKEY (raw key) + X-AUTH-SIGNATURE (hex HMAC-SHA256 of
+the exact JSON-serialized request body, using the API secret as the HMAC
+key). Every authenticated request embeds a `timestamp` field in the body;
+every official code sample uses epoch MILLISECONDS
+(int(time.time()*1000)) despite some prose elsewhere saying "seconds" --
+the code samples were trusted. CoinDCX documents NO way to scope a key as
+read-only vs trading-enabled -- this is recorded explicitly (section 2 of
+docs/coindcx_api_findings.md) as a real constraint: the safety boundary is
+entirely in AlphaOne's own code, not the exchange's key permissions.
+
+4. READ-ONLY SECURITY ARCHITECTURE
+------------------------------------------------------------
+services/exchange/coindcx.py implements ExchangeMarketDataProvider and
+ExchangeAccountProvider. CoinDCXReadOnlyAccountProvider exposes exactly:
+get_connection_status, get_balance, get_open_positions, get_trade_history
+(the shared interface) plus get_transactions/get_orders (CoinDCX-specific
+reads). It has NO method resembling create_order, cancel_order, edit_order,
+update_leverage, add_margin, remove_margin, exit_position, create_tpsl,
+margin_type, or wallet transfer -- every one of those real, documented
+CoinDCX endpoints is deliberately absent from this codebase, recorded in
+docs/coindcx_api_findings.md precisely so the omission is a documented
+choice, not an oversight. tests/unit/test_no_order_placement_capability.py
+was extended (not replaced) to introspect CoinDCX's classes alongside
+SunCrypto's, with an expanded forbidden-term blacklist (add_margin,
+remove_margin, margin_type, withdraw, etc.) plus a whitelist check that
+every account-provider method starts with get_ (a documented `close`
+lifecycle exception aside). This test runs on every suite execution.
+
+5. COINDCX MARKET DATA
+------------------------------------------------------------
+CoinDCXMarketDataProvider makes real calls (verified against a mocked
+HTTP transport shaped exactly like CoinDCX's documented responses,
+tests/unit/test_coindcx_provider.py) to the active-instruments,
+real-time-prices, historical-trades, and REST-candlestick endpoints.
+normalize_symbol()/denormalize_symbol() convert between AlphaOne's
+"BTC/USDT" and CoinDCX's "B-BTC_USDT" instrument format -- a real
+difference from the Binance format used throughout Phases 1-4, confirmed
+from CoinDCX's own active-instruments response, not assumed.
+
+6. COINDCX ACCOUNT DATA
+------------------------------------------------------------
+get_balance() computes total_equity/available_balance/used_margin from
+locked_balance + cross_order_margin + cross_user_margin -- CoinDCX's own
+docs literally say to ignore the wallet's `balance` field, and a test
+(test_get_balance_ignores_the_balance_field_per_coindcx_docs) proves a
+fabricated-looking `balance` value never leaks into AlphaOne's numbers.
+get_open_positions() filters CoinDCX's per-pair rows to active_pos != 0
+and computes unrealized_pnl (CoinDCX's position object has none) as
+active_pos * (mark_price - avg_price) -- documented in code and
+docs/coindcx_api_findings.md as AlphaOne-computed, not exchange-reported.
+Every method reports NOT_CONFIGURED/UNAVAILABLE/AUTH_FAILURE/
+CONNECTION_LOST rather than raising or fabricating data when credentials
+are absent or a call fails (tests/unit/test_coindcx_provider.py, 14 tests).
+
+7. POSITION MONITORING
+------------------------------------------------------------
+services/position_monitor/monitor.py (Phase 4I) extended, not rewritten:
+ExitAlert now carries symbol/entry_price/computed-pnl (via the same
+services/trade_journal/pnl.py formula used everywhere else) so the
+Telegram EXIT ALERT template can show real numbers. Checks are read-only
+and recommend only -- verified explicitly
+(test_monitor_never_closes_the_trade_itself) that a breach never changes
+Trade.status. Dedup via NotificationLog prevents the same breach being
+re-alerted on every check.
+
+8. TRADE SYNCHRONIZATION
+------------------------------------------------------------
+services/exchange/coindcx_sync.py: sync_positions() diffs live CoinDCX
+positions against known open Trade rows (source=COINDCX_SYNC). New
+positions are matched to signals via the Phase 4 matcher --
+AUTO_MATCHED/AMBIGUOUS/UNMATCHED, never guessed. Positions that
+disappear are closed using the REAL closing fill(s) from
+get_trade_history (volume-weighted average price across however many
+fills happened), via the same record_exit() function Phase 4 built for
+manual exits -- reused, not duplicated. If no real closing fill can be
+found, the trade is left OPEN and a FAILED SyncEvent is logged instead of
+guessing a close (test_disappeared_position_with_no_closing_fill_stays_open_and_flags_event).
+sync_trade_fills() idempotently ingests raw fills as TradeExecution audit
+rows, keyed by a deterministic id derived from
+order_id+timestamp+price+quantity+side (CoinDCX documents no single
+unique fill id) -- proven idempotent
+(test_sync_trade_fills_is_idempotent: identical fills synced twice
+produce exactly one row).
+
+9. ACCOUNT SYNCHRONIZATION
+------------------------------------------------------------
+sync_balance() pulls the wallet, records an AccountSnapshot
+(equity/available_balance/used_margin, source=LIVE), and updates
+Account.connection_status/last_synced_at. NOT_CONFIGURED and connection
+failures are both recorded honestly (a FAILED SyncEvent, connection_status
+= DISCONNECTED) -- never silently promoted to LIVE
+(test_sync_balance_not_configured_never_claims_live,
+test_sync_balance_failure_marks_disconnected_and_logs_event). A real bug
+was found and fixed via manual browser testing: the dashboard trusted a
+pre-Phase-5 account row's stale stored connection_status directly,
+showing "Disconnected" instead of "Not Configured" -- fixed by checking
+whether credentials are actually configured right now rather than
+trusting a possibly-outdated stored value (see section 19).
+
+10. P&L / RECONCILIATION
+------------------------------------------------------------
+Realized P&L on a CoinDCX-synced close comes from the real closing
+fill(s), computed by the same fee-inclusive formula
+(services/trade_journal/pnl.py) used for every manual trade -- no
+double-counted fees. Unrealized P&L is computed (see section 6), refreshed
+on every position sync, and read by the dashboard from the DB (not a live
+API call on every page load, to avoid hammering CoinDCX). The existing
+Phase 4 reconciliation endpoint (GET /accounts/reconcile -- theoretical
+equity from deposits/withdrawals/trade PnL vs. the latest reported
+AccountSnapshot) is unchanged and was exercised in the final acceptance
+test; it reports NO_SNAPSHOT/OK/MISMATCH and never silently adjusts a
+number on mismatch.
+
+11. SIGNAL INTEGRATION
+------------------------------------------------------------
+Unchanged from Phase 4 by design, per this phase's explicit instruction:
+BaselineStrategy (Donchian+ADX, Phase 2.6's strongest, still-unverified
+baseline) remains the only strategy wired into the live
+/signals/generate endpoint. Phase 3's finding that no ML model
+demonstrated a validated edge is not revisited or overridden. New in
+Phase 5: a CoinDCX-detected position now runs through the exact same
+signal-matching path a manually-entered trade already used
+(test_new_position_auto_matches_a_confident_signal,
+test_new_position_with_two_close_signals_is_ambiguous,
+test_new_position_with_no_signal_candidate_is_unmatched).
+
+12. EXIT MONITORING
+------------------------------------------------------------
+GET /journal/exit-alerts (Phase 4I, unchanged endpoint) now returns
+richer alerts including symbol/entry_price/pnl for the updated Telegram
+template. exit_alert_job (services/scheduler/jobs.py) sources its price
+from the latest ingested candle and is a deliberate no-op if none exists
+-- it will not generate an alert against a price it can't source. Every
+exit path remains a recommendation: no code anywhere calls a CoinDCX
+order-mutating endpoint, verified by the security test AND by direct
+assertion inside the final acceptance test that the trade stayed OPEN
+after an alert fired.
+
+13. TELEGRAM
+------------------------------------------------------------
+All 12 Phase 4 commands preserved. /account now calls
+CoinDCXReadOnlyAccountProvider.get_balance() directly and reports real
+Equity/Available/Used Margin when connected, or an honest NOT_CONFIGURED/
+UNAVAILABLE status otherwise (tests/unit/test_telegram_bot.py, 11 tests
+including a monkeypatched "shows real numbers when CoinDCX reports OK"
+case). Added send_position_detected() (POSITION DETECTED template,
+section 27) and rewrote send_exit_alert() to the exact EXIT ALERT
+template from the brief (CONSIDER MANUAL EXIT ON COINDCX / MANUAL
+EXECUTION REQUIRED). Two leftover "SunCrypto" strings in /start and
+send_signal() were found via a repo-wide grep and fixed. Per the user's
+explicit choice this session, still tested against mocks only -- no real
+BOT_TOKEN was used; going live needs only .env values.
+
+14. BACKGROUND SCHEDULER
+------------------------------------------------------------
+services/scheduler/: a CircuitBreaker (CLOSED/OPEN/HALF_OPEN, exponential
+backoff, clock-injectable like the Phase 2.6 RiskEngine's `now` parameter
+-- 6 tests) guards each of 4 independent jobs (account sync every 30s,
+exit-alert checks every 30s, signal generation every 15 min, signal-
+outcome evaluation every 15 min -- frequencies documented in
+services/scheduler/jobs.py's own docstring since CoinDCX publishes no
+futures-specific rate-limit table). SchedulerRunner wires these into
+FastAPI's lifespan, started ONLY when SCHEDULER_ENABLED=true (default
+false, so the test suite and local dev never trigger it) -- explicitly
+NOT designed to run inside a serverless function. 7 tests cover each
+job's circuit-breaker gating and the start/stop lifecycle; the scheduler
+was never run continuously against a live account this session (see
+section 19).
+
+15. DASHBOARD
+------------------------------------------------------------
+GET /api/v1/dashboard/ extended (not replaced) with exchange="COINDCX",
+account_data_source (LIVE/STALE/DISCONNECTED/NOT_CONFIGURED, computed
+from real credential-configured state, not a possibly-stale stored
+value), last_synced_at, open_positions (count), unrealized_pnl (summed
+from live-synced Trade rows), risk_status, and telegram_enabled. The
+frontend dashboard page now shows Total Equity/Available Balance/Used
+Margin cards, a COINDCX connection badge with a freshness label ("Updated
+Ns ago"), Risk Status, and Telegram status -- all verified in a real
+browser against the real (credential-less) local research DB: every
+value correctly showed N/A/Not Configured, nothing fabricated. The
+Settings page gained a "CoinDCX Connection" section (Sync Now button,
+connection state, last-sync timestamp, a note directing the user to
+server-side env vars -- no credential entry field in the browser, per the
+brief). The Trades page gained Source (Manual/CoinDCX) and Match columns,
+with a "Needs confirmation" control for AMBIGUOUS matches that fetches
+and displays POSSIBLE SIGNAL MATCHES and confirms via the existing Phase
+4 endpoint.
+
+16. DATABASE CHANGES
+------------------------------------------------------------
+Migration 004 (does not modify migration 003): trades gained
+exchange_position_id, exchange_trade_id (partial unique index, SQLite AND
+Postgres via sqlite_where/postgresql_where), mark_price,
+liquidation_price, unrealized_pnl, margin, data_source, match_status,
+last_synced_at; trade_executions gained exchange_transaction_id (same
+partial-unique pattern); accounts gained last_synced_at; account_snapshots
+gained available_balance/used_margin/unrealized_pnl/realized_pnl. A
+one-time data fix updates existing accounts.exchange rows from 'suncrypto'
+to 'coindcx' (safe: no real SunCrypto account was ever actually connected,
+since no such API exists). New enums: TradeSource.COINDCX_SYNC (keeping
+SUNCRYPTO_SYNC for historical rows), SignalMatchStatus, ConnectionState.
+Applied cleanly to the local SQLite dev DB.
+
+17. TESTS
+------------------------------------------------------------
+281 (end of Phase 4) -> 342 passed, 0 failed, 0 skipped. New test files:
+test_coindcx_provider.py (14 -- market data, auth signature verification
+against the documented HMAC scheme, the "ignore balance field" rule,
+position filtering/PnL computation, auth/rate-limit/network-failure
+handling, no-credentials-required), test_coindcx_no_credential_logging.py
+(3 -- structlog capture proving a realistic-looking secret never appears
+in any log event on any failure path), test_coindcx_sync.py (10 --
+balance/position/trade-fill sync logic against a fake provider),
+test_coindcx_ws.py (11 -- WebSocket message parsing and freshness state,
+zero real connections), test_circuit_breaker.py (6), test_scheduler_runner.py
+(7), test_api_phase5_coindcx_flow.py (6, including the trade-serialization
+regression test from section 19), test_phase5_final_acceptance.py (1,
+the full end-to-end simulation from section 22). Existing
+test_no_order_placement_capability.py, test_exchange_sync.py, and
+test_telegram_bot.py were extended/updated for the new vocabulary and
+CoinDCX classes, not rewritten.
+
+18. SECURITY VERIFICATION
+------------------------------------------------------------
+(1) No order-mutating method exists anywhere in the codebase --
+tests/unit/test_no_order_placement_capability.py, blacklist + whitelist,
+covers both SunCrypto and CoinDCX classes, runs every suite execution.
+(2) API keys are server-side env vars only (COINDCX_API_KEY/SECRET,
+apps/api/config.py) -- never NEXT_PUBLIC_*, verified by inspection of
+every frontend fetch call (none reference these vars). (3) Credentials
+are never logged -- tests/unit/test_coindcx_no_credential_logging.py,
+structlog capture across auth-failure and network-failure paths. (4)
+Account/position values are parsed per the exact documented schema
+(section 6), with the "ignore balance field" quirk explicitly handled.
+(5) Duplicate synchronization is prevented (idempotent trade-fill
+ingestion, section 8). (6) Stale data is detected and labeled (STALE/
+DISCONNECTED/UNAVAILABLE, never silently presented as LIVE). (7) Exit
+alerts never execute anything (section 12, proven by direct assertion in
+the final acceptance test). (8) The Phase 2.6 RiskEngine remains the sole
+authority on risk state -- nothing in Phase 5 added a second risk model
+or gave the scheduler any trading authority.
+
+19. KNOWN LIMITATIONS
+------------------------------------------------------------
+Full detail in docs/known_limitations.md (Phase 5 section). Headlines: no
+real CoinDCX credentials were available this session -- every provider/
+sync/WebSocket path is verified against mocks shaped exactly like
+CoinDCX's documented schemas, but a real account's actual responses
+should be spot-checked before going live (see section 21). CoinDCX
+documents no read-only key scoping, so a leaked key is as dangerous as
+any other. The WebSocket client's connect()/reconnect path was never
+exercised against a real server (message parsing and freshness logic
+are fully unit-tested; python-socketio's built-in reconnection is
+configured, not reimplemented). The scheduler has never run continuously
+against a live account. Position "opened_at" is approximated as sync
+time, not the exchange's real fill time (CoinDCX's position object
+doesn't expose one). Closing a disappeared position uses a
+volume-weighted-average of real fills rather than modeling each partial
+fill individually. sync_trade_fills attaches raw fills to the
+most-recently-opened Trade per symbol (adequate for this platform's
+single-position-per-symbol model, would misattribute under concurrent
+positions on the same symbol). Two real bugs were found ONLY by manual
+browser verification and fixed same-session: the dashboard trusted a
+stale stored connection_status instead of checking real credential state
+(section 9), and trades.py/journal.py's trade serialization omitted
+match_status and every live-sync field entirely, so the new Match column
+silently showed "--" for every trade -- both fixed with regression tests.
+
+20. DEPLOYMENT REQUIREMENTS
+------------------------------------------------------------
+Full detail in docs/deployment.md. Summary: Vercel frontend; a persistent
+(non-serverless) backend process -- required now more than in Phase 4,
+since the scheduler's asyncio loops and (if wired in) the CoinDCX
+WebSocket connection both need a long-lived process, not a
+request-scoped function; Postgres in production (Phase 5's partial
+unique indexes are written for both SQLite and Postgres); Redis reserved
+for future higher-volume rate-limiting/dedup. New env vars:
+COINDCX_API_KEY, COINDCX_API_SECRET, SCHEDULER_ENABLED -- all server-side
+only, documented in .env.example. Nothing has been deployed.
+
+21. MANUAL REAL-ACCOUNT SETUP INSTRUCTIONS
+------------------------------------------------------------
+When real CoinDCX read-only credentials are available:
+1. Generate an API key/secret from the CoinDCX website (no read-only
+   scoping option exists per the docs -- treat the key as fully
+   sensitive regardless).
+2. Set COINDCX_API_KEY and COINDCX_API_SECRET as server-side environment
+   variables (.env locally, real secrets manager in production) --
+   never in the frontend, never committed.
+3. Leave SCHEDULER_ENABLED=false initially. Start the backend and call
+   GET /api/v1/accounts/balance and GET /api/v1/accounts/positions
+   manually (or POST /api/v1/accounts/sync) to verify the real response
+   shapes match what services/exchange/coindcx.py expects -- specifically
+   confirm the wallet response has the fields this code reads
+   (locked_balance/cross_order_margin/cross_user_margin) and that any
+   real open position parses into a sensible normalized dict (correct
+   side/quantity/entry_price/unrealized_pnl sign).
+4. Only after that manual verification succeeds, set
+   SCHEDULER_ENABLED=true and restart the backend to begin continuous
+   monitoring.
+5. Set TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID/TELEGRAM_ENABLED=true when
+   ready for real alerts -- independent of the CoinDCX credentials above.
+
+22. FINAL ACCEPTANCE TEST
+------------------------------------------------------------
+tests/integration/test_phase5_final_acceptance.py simulates the complete
+brief end-to-end against mocks in one test, passing on first run: (1) a
+real signal generated from real seeded candle data, (2) a mock CoinDCX
+position appears matching that signal, (3) it is detected via
+POST /accounts/sync, (4) the dashboard reflects the open position and
+real account balance, (5) a stop-loss breach is simulated and
+GET /journal/exit-alerts correctly recommends an exit, (6) the position
+is directly confirmed to remain OPEN afterward -- no auto-close, (7) the
+mock position "disappears" with a real closing fill and a second sync
+closes it for real, with real P&L computed, (8) signal-outcome evaluation
+runs independently via POST /signals/evaluate-outcomes, (9)
+GET /portfolio/performance still returns backtest/alphaone_signals/
+user_actual as three distinct, unmixed keys, (10) the equity curve
+reflects the real close, (11) reconciliation runs without error, and (12)
+a final introspection assertion confirms no order-placing method exists
+on the account provider class used throughout the test.
+
+23. EXACT TEST COUNT
+------------------------------------------------------------
+342 passed, 0 failed, 0 skipped (pytest tests/ -v). Up from 281 at the
+end of Phase 4 -- 61 new tests added this phase, zero existing tests
+lost, all pre-existing Phase 1-4 tests still green.
+
+============================================================
+Per the user's explicit closing instruction: AlphaOne remains
+architecturally incapable of placing, cancelling, modifying, or closing
+any CoinDCX order, changing leverage, or transferring/withdrawing funds.
+It monitors, analyzes, alerts, tracks, and reports -- the user manually
+trades on CoinDCX. Stopping here per the brief -- no further phase begins
+automatically.
+============================================================

@@ -1,0 +1,362 @@
+============================================================
+ALPHAONE AI
+LIVE MARKET DATA PHASE
+============================================================
+
+STATUS LEGEND USED THROUGHOUT: MOCK TESTED | REAL CONNECTION TESTED | PRODUCTION READY
+(these are three different claims -- never conflated below)
+
+------------------------------------------------------------
+1. OFFICIAL COINDCX WEBSOCKET CAPABILITY VERIFIED
+------------------------------------------------------------
+
+Verified directly against the live official docs at
+https://docs.coindcx.com ("Futures Sockets" section), by rendering the
+real page in-browser and reading the DOM (not a summarizer -- an early
+attempt via URL-fetch summarization fabricated plausible-looking but
+fake channel names, e.g. "top-level-current-prices", and was discarded
+after independent browser verification exposed the discrepancy; treat
+this as a reminder that AI-summarized doc fetches can hallucinate and
+must be cross-checked for anything security/correctness-relevant).
+
+Confirmed real, current CoinDCX Futures Sockets capabilities:
+- Get Current Prices (mark price, ALL pairs in one stream)
+- Get Candlestick Data (documented resolutions: 1m/5m/15m/30m/1h/4h/8h/1d/3d/1w/1M)
+- Get LTP Data (last-traded-price ticks)
+- Get New Trade (individual trade prints)
+- Get Orderbook (depth snapshots, depth 10/20/50)
+- Get Position/Order/Balance Update (AUTHENTICATED "coindcx" channel --
+  Phase 5's existing services/exchange/coindcx_ws.py, untouched here)
+No index-price stream/field is documented anywhere in this API.
+
+------------------------------------------------------------
+2. ENDPOINT / CHANNEL USED
+------------------------------------------------------------
+
+Endpoint: wss://stream.coindcx.com (Socket.IO protocol, same as Phase 5's
+authenticated client -- python-socketio, not a raw websocket).
+
+Channels joined by the new public client (no authentication):
+- "B-BTC_USDT@prices-futures" -> event "price-change" (last-traded price)
+- "currentPrices@futures@rt"  -> event "currentPrices@futures#update" (mark price, all pairs, filtered to our instrument)
+
+Not joined: candlestick, orderbook, and new-trade channels -- not needed
+for this phase's dashboard/monitoring-freshness purpose (see section 10).
+
+------------------------------------------------------------
+3. BTC/USDT INSTRUMENT MAPPING
+------------------------------------------------------------
+
+Subscribes to B-BTC_USDT specifically -- NOT B-BTC_INR, the instrument
+the user's real CoinDCX account actually trades (INR-margined, Phase 5).
+This is deliberate: B-BTC_USDT is genuinely USDT-denominated, matching
+AlphaOne's canonical "BTC/USDT" symbol and the Binance-sourced strategy's
+own price terms, and plugs directly into the existing USDT->INR
+conversion pipeline (services/exchange/fx.py) built for the INR-only UI.
+The real position's own mark price is a separate, already-live (30s REST
+poll), already-INR-native data path (Phase 5, unchanged) -- this client
+never feeds real position PnL math, only the dashboard's market-price
+display and connection-freshness state. Documented in full in
+services/market_data/coindcx_ws.py's module docstring and
+docs/known_limitations.md.
+
+------------------------------------------------------------
+4. PRICE FIELDS USED
+------------------------------------------------------------
+
+- last_price_usdt  <- "price-change" event's "p" field (last traded price)
+- mark_price_usdt  <- "currentPrices@futures#update" event's "mp" field for B-BTC_USDT
+- index_price_usdt <- always None; no such field/channel exists in CoinDCX's documented futures WS API (never fabricated)
+- Dashboard "BTC Price" card uses last_price_usdt (the live ticker), matching section 2's "live ticker/last price for LIVE MARKET DISPLAY" guidance.
+
+------------------------------------------------------------
+5. MARK-PRICE HANDLING
+------------------------------------------------------------
+
+Mark price is captured (mark_price_usdt, exposed on the dashboard as
+market_data_mark_price_usdt) but intentionally NOT used for the real
+position's unrealized P&L -- that already uses the exchange's own
+per-position mark_price from the authenticated REST sync (Phase 5, INR-
+native, correct instrument). Using B-BTC_USDT's mark price for a
+B-BTC_INR position would silently apply the wrong market's price to a
+real position. Verified by a test asserting the new module is never
+imported by position/exit-monitoring code.
+
+------------------------------------------------------------
+6. WEBSOCKET IMPLEMENTATION
+------------------------------------------------------------
+
+New file: services/market_data/coindcx_ws.py (CoinDCXMarketDataWebSocket)
+-- deliberately separate from Phase 5's services/exchange/coindcx_ws.py
+(the authenticated account channel, untouched). Pure, unit-testable
+message handlers (handle_price_change, handle_current_prices) are
+decoupled from the socket.io event adapters, which extract/normalize the
+real wire payload via a new _extract_payload() helper (see section 18 for
+why this was necessary). A process-wide singleton
+(services/market_data/live_state.py) wires it into the FastAPI app
+lifespan (apps/api/main.py) behind a new MARKET_DATA_WS_ENABLED flag
+(default false, same pattern as SCHEDULER_ENABLED/TELEGRAM_ENABLED), and
+into a Telegram connection-alert callback + a SyncEvent audit-trail row
+on every real connection transition. No per-tick database writes --
+only the latest state (in-memory) and connection-transition events are
+ever persisted, per the explicit instruction not to grow the database
+with tick-level rows, and no Redis was introduced (none exists in this
+architecture; not warranted for a single in-process latest-value cache).
+
+------------------------------------------------------------
+7. HEARTBEAT
+------------------------------------------------------------
+
+Implements CoinDCX's own documented sample exactly: emits
+{"data": "Ping message"} on the "ping" event every 25 seconds while
+connected, starting on connect and cancelled on disconnect. MOCK TESTED
+(fake-emit + fake-sleep harness proves the exact payload and cadence
+logic) and REAL CONNECTION TESTED implicitly (the real 20-second
+connectivity run stayed connected the whole window without the server
+dropping it).
+
+------------------------------------------------------------
+8. RECONNECT
+------------------------------------------------------------
+
+Delegated to python-socketio's own built-in reconnection (exponential
+backoff 2s -> 30s cap, unlimited attempts) -- the same choice already
+made in Phase 5's account client, not reimplemented. Resubscription is
+automatic: socket.io re-invokes the "connect" handler on every successful
+reconnect (a fresh server-side session), so the exact same join messages
+fire again with no risk of accumulating duplicate subscriptions. MOCK
+TESTED: a full CONNECTED -> DISCONNECTED -> RECONNECTING(implicit) ->
+CONNECTED cycle is simulated and asserted to resubscribe correctly and
+fire exactly one DISCONNECTED alert and one RECOVERED alert (never
+duplicated). NOT independently real-tested (see section 18/21 -- the real
+run was a single continuous 20s connection, deliberately not run long
+enough to provoke or wait for a real network drop).
+
+------------------------------------------------------------
+9. STALE DETECTION
+------------------------------------------------------------
+
+Threshold: 20 seconds (DEFAULT_STALE_AFTER), chosen because BTC/USDT
+futures trade roughly every few seconds on CoinDCX during normal
+activity (confirmed by the real connectivity test: dozens of price-change
+ticks within a 20-second window) -- tight enough to catch a real stall
+quickly without flapping to STALE on ordinary gaps between trades, and
+explicitly not an "extremely long" timeout. LIVE / STALE / DISCONNECTED /
+UNAVAILABLE are all implemented and MOCK TESTED (including recovery from
+STALE back to LIVE on a fresh tick, and UNAVAILABLE specifically for
+"never connected yet" vs. DISCONNECTED for "was connected, then dropped").
+
+------------------------------------------------------------
+10. CANDLE HANDLING
+------------------------------------------------------------
+
+The Donchian+ADX strategy's candle source is UNCHANGED -- still the
+existing Binance-ingested historical candles (Phases 1-3). CoinDCX does
+officially provide a candlestick WebSocket channel
+({instrument}_{resolution}-futures), but switching the strategy to
+consume it would mean adopting a new, unvalidated data source (a
+different exchange, with no leak-free/quality testing ever done against
+it) -- explicitly out of scope per the instruction not to rewrite the
+strategy. This phase's live WebSocket feeds ONLY dashboard display and
+monitoring freshness; signal generation remains entirely
+candle-completion-driven, proven by a test that feeds 50 live ticks
+through the WS client and asserts generate_and_persist_signal /
+notify_new_signal are never called as a side effect.
+
+------------------------------------------------------------
+11. POSITION MONITORING
+------------------------------------------------------------
+
+Unchanged from Phase 5: the real position's mark price and unrealized
+P&L already come from a live (30-second) REST poll of the account's own
+real positions (correct instrument, already INR-native) -- this
+requirement was already satisfied before this phase and needed no new
+code. The new public WebSocket is architecturally kept out of this path
+(section 5), verified by test.
+
+------------------------------------------------------------
+12. EXIT MONITORING
+------------------------------------------------------------
+
+Unchanged from Phase 5 (services/scheduler/jobs.py's exit_alert_job,
+still on its existing 30-second cadence, still REST-based, still
+generating the same "EXIT ALERT ... CONSIDER MANUAL EXIT ON COINDCX ...
+MANUAL EXECUTION REQUIRED" template -- never "CLOSE POSITION", never an
+order). Not modified in this phase.
+
+------------------------------------------------------------
+13. DASHBOARD
+------------------------------------------------------------
+
+apps/api/routers/dashboard.py now prefers the live WebSocket price
+(btc_price_usdt/btc_price_inr, converted via the existing INR pipeline)
+whenever it has ever delivered a tick, exposing market_data_source
+("CoinDCX WebSocket" vs. "Binance (historical candle ingestion)"),
+market_data_status (LIVE/STALE/DISCONNECTED/UNAVAILABLE), and
+market_data_mark_price_usdt. When the WebSocket has never delivered a
+price (its default state -- MARKET_DATA_WS_ENABLED defaults to false),
+the dashboard falls back to the exact pre-existing Binance-candle
+behavior, verified by a dedicated regression test, so every prior
+dashboard test kept passing unmodified. Frontend UI wiring (the
+dashboard page rendering these new fields visually) was NOT done in this
+phase -- see section 20.
+
+------------------------------------------------------------
+14. INR CONVERSION
+------------------------------------------------------------
+
+The existing INR-only UI implementation (services/exchange/fx.py) was
+not modified, and is reused as-is: the live USDT price is converted via
+the same real CoinDCX USDT/INR spot-ticker source, carrying
+conversion_rate/conversion_timestamp/conversion_source/conversion_status
+alongside every value. A test proves the dashboard reports
+btc_price_inr=None and conversion_status="UNAVAILABLE" (never a
+fabricated INR figure) when the conversion rate can't be fetched, even
+though a real live USDT price is available.
+
+------------------------------------------------------------
+15. TELEGRAM
+------------------------------------------------------------
+
+New: send_market_data_alert() sends "COINDCX MARKET DATA DISCONNECTED" /
+"...RECOVERED" -- event-driven, fired at most once per real connection
+transition (never per-tick, never per-poll), suppressed on the very first
+connect at startup (not a "recovery" from anything). No $ /USD anywhere
+in the new template. TELEGRAM_ENABLED continues to gate all sends,
+unchanged. MOCK TESTED (dedup logic, enabled/disabled gating, both
+message variants).
+
+------------------------------------------------------------
+16. SECURITY / NO-ORDER VERIFICATION
+------------------------------------------------------------
+
+CoinDCXMarketDataWebSocket added to test_no_order_placement_capability.py's
+forbidden-substring scan (no method name anywhere resembles an order/
+cancel/modify/leverage/margin/withdraw action) plus a new explicit test
+proving its constructor accepts no api_key/api_secret at all -- it is
+architecturally incapable of even joining the authenticated account
+channel, let alone placing an order. Zero real trades were placed at any
+point in this phase (confirmed: 417 passing tests including this one, and
+the real connectivity test used only unauthenticated public channels).
+
+------------------------------------------------------------
+17. MOCK WEBSOCKET TESTS
+------------------------------------------------------------
+
+33 tests in tests/unit/test_coindcx_market_ws.py, covering all 23
+requested scenarios: connect, subscribe, receive valid ticker, parse
+price, parse timestamp, normalize symbol, update live state, heartbeat,
+disconnect, reconnect, resubscribe, stale detection, recovery, malformed
+message, duplicate message, unknown symbol, missing price, plus the
+real-wire-format regression (section 18). INR conversion failure, signal
+deduplication, position P&L boundary, exit-monitoring boundary, Telegram
+state-transition alerts, and no-order-endpoint verification are covered
+by 6 additional tests in tests/integration/test_live_market_data_flow.py
+plus 1 in test_no_order_placement_capability.py plus 3 in
+test_telegram_bot.py. None of these require or ever open a real
+connection.
+
+------------------------------------------------------------
+18. REAL WEBSOCKET CONNECTIVITY TEST
+------------------------------------------------------------
+
+REAL CONNECTION TESTED. scripts/coindcx_market_ws_connectivity_test.py
+connected to the real wss://stream.coindcx.com, joined only the two
+public channels above, ran for a bounded 20-second window, and
+disconnected cleanly. First run FAILED with a real, previously-unknown
+bug: CoinDCX wraps every event's payload as
+{"event": "<name>", "data": "<JSON-encoded STRING>"} -- the official
+docs' response samples show only the inner shape, not this string-encoded
+wrapper, so the initial adapter crashed
+(AttributeError: 'str' object has no attribute 'get') on the very first
+real message. Diagnosed directly against the live socket, fixed via a
+new _extract_payload() helper, and locked in with 7 new regression tests
+using the exact real captured payload strings. Second run PASSED:
+
+  Connection: PASS
+  LTP (price-change) received: PASS -- last_price_usdt = 78032.0
+  Mark price (currentPrices) received: PASS -- mark_price_usdt = 78031.9
+  Freshness: last message 0.3s ago
+  Real trades placed: 0
+
+Not real-tested: a genuine network-drop-triggered reconnect (the run was
+a single continuous 20s window, deliberately not run long enough to wait
+for or provoke a real disconnect) -- reconnect/resubscribe is MOCK TESTED
+only. Flagged as a follow-up: services/exchange/coindcx_ws.py (Phase 5's
+authenticated account channel) uses the same vulnerable payload-parsing
+pattern and has never been run against a real connection -- very likely
+has the identical latent bug. A background task has been queued to verify
+and fix it separately, since fixing it wasn't part of this phase's scope
+and the instructions were explicit not to rewrite completed work
+speculatively.
+
+------------------------------------------------------------
+19. FULL TEST COUNT
+------------------------------------------------------------
+
+Backend: 417 passed, 1 skipped, 0 failed (was 374 passed/1 skipped before
+this phase -- +43 new tests: 33 in test_coindcx_market_ws.py, 6 in
+test_live_market_data_flow.py, 1 in test_no_order_placement_capability.py,
+3 in test_telegram_bot.py). No existing test was deleted or weakened.
+Frontend: 16 passed, unchanged (no frontend changes made in this phase).
+
+------------------------------------------------------------
+20. REMAINING LIMITATIONS
+------------------------------------------------------------
+
+- Dashboard/chart FRONTEND pages were not updated to visually render the
+  new market_data_source/market_data_status/market_data_mark_price_usdt
+  fields -- the backend now exposes them correctly (proven by tests and
+  the real connectivity test), but the Next.js dashboard page still shows
+  only what it showed before this phase. Wiring the UI is a natural next
+  step, not done here since it wasn't explicitly requested and this
+  report was scoped to the backend live-data pipeline.
+- Reconnect-after-a-real-network-drop and the "COINDCX MARKET DATA
+  DISCONNECTED/RECOVERED" Telegram alerts have not been exercised against
+  a real dropped connection, only mocked.
+- services/exchange/coindcx_ws.py (Phase 5's authenticated channel) is
+  suspected to share the real-wire-format bug found here; unverified,
+  flagged as a queued follow-up task, not fixed in this phase.
+- No historical candlestick data was pulled from CoinDCX's own documented
+  candle WebSocket channel -- the strategy intentionally still runs on
+  Binance data only (section 10).
+- MARKET_DATA_WS_ENABLED is left at `false` in both .env and .env.example
+  -- this phase did not enable continuous live streaming in the running
+  dev process, per "do not deploy yet."
+
+------------------------------------------------------------
+21. PRODUCTION DEPLOYMENT READINESS
+------------------------------------------------------------
+
+MOCK TESTED: heartbeat, reconnect/resubscribe logic, stale/recovery state
+machine, malformed/duplicate/unknown-symbol/missing-price message
+handling, signal-generation boundary, position/exit-monitoring boundary,
+Telegram alert dedup, security/no-order capability. 40 tests, all green.
+
+REAL CONNECTION TESTED: a single bounded 20-second live connection to the
+real CoinDCX public WebSocket, confirming real price/mark-price data
+flows end-to-end into the normalized state and (via a separate
+integration test) into the dashboard's conversion pipeline. This found
+and fixed one real bug that mocks alone could not have caught.
+
+NOT PRODUCTION READY yet, specifically because:
+- No real, extended-duration soak test (hours, across natural network
+  blips) has been run -- only a 20-second window.
+- No real reconnect-after-drop has been observed live.
+- The frontend dashboard does not yet visually surface the new fields.
+- The suspected identical bug in Phase 5's authenticated channel is
+  unverified and unfixed.
+- This was run entirely against a local dev process, not the target
+  persistent backend/worker deployment (Vercel frontend + separate
+  backend/worker, per section 18 of the request) -- that separation is
+  architecturally respected in the code (the WebSocket only ever runs
+  inside apps/api/main.py's lifespan, never in the frontend), but has not
+  been deployed or tested in that topology.
+
+No trading logic, signal thresholds, risk engine, or position sizing was
+changed. No automatic trading capability exists or was added. Zero real
+orders were placed. No deployment was performed.
+
+============================================================
+DONE. Stopping here as instructed. Not deployed. Automatic trading not enabled.
+============================================================

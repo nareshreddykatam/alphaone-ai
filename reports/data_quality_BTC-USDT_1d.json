@@ -1,0 +1,19 @@
+{
+  "symbol": "BTC/USDT",
+  "timeframe": "1d",
+  "period_start": "2023-08-28 00:00:00",
+  "period_end": "2026-08-26 00:00:00",
+  "row_count": 1095,
+  "expected_row_count": 1095,
+  "missing_count": 0,
+  "duplicate_count": 0,
+  "invalid_count": 0,
+  "out_of_order_count": 0,
+  "stale": false,
+  "stale_reason": null,
+  "gaps": [],
+  "invalid_reasons": {},
+  "duplicate_timestamps": [],
+  "liquidation_coverage": "not_assessed",
+  "coverage_pct": 100.0
+}

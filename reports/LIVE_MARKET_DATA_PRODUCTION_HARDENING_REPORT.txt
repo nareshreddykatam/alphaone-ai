@@ -1,0 +1,205 @@
+============================================================
+ALPHAONE AI
+LIVE MARKET DATA PRODUCTION HARDENING
+============================================================
+
+Initial connection retry:      PASS
+Retry backoff:                 PASS
+Shutdown handling:              PASS
+No duplicate retry loops:      PASS
+Existing reconnect:            PASS
+Telegram dedup:                PASS
+Security/no-order:             PASS
+
+Backend tests:   440 passed, 1 skipped, 0 failed (was 428/1 before this change; +12 new tests)
+Frontend tests:  16 passed, 0 failed (unchanged -- no frontend code touched)
+TypeScript:      clean (tsc --noEmit, 0 errors)
+
+Real WebSocket startup: PASS
+
+Real trades: 0
+
+------------------------------------------------------------
+WHAT WAS BUILT
+------------------------------------------------------------
+
+services/market_data/live_state.py now owns a `_StartupRetrySupervisor`:
+a single background task that retries ONLY the live market-data
+WebSocket's INITIAL connect() with exponential backoff
+(2s/4s/8s/16s/30s, holding at 30s once the table is exhausted). The
+moment that first connect succeeds, the supervisor's job is done --
+every subsequent drop/reconnect is handled entirely by
+CoinDCXMarketDataWebSocket's own existing, unmodified python-socketio
+reconnection (services/market_data/coindcx_ws.py was not touched).
+apps/api/main.py's lifespan was NOT modified -- it still calls
+`asyncio.create_task(start_market_data_ws())` / `stop_market_data_ws()`
+exactly as before; both functions kept their existing signatures and now
+delegate to the supervisor internally.
+
+------------------------------------------------------------
+1. INITIAL CONNECTION RETRY -- PASS
+------------------------------------------------------------
+
+A failed first attempt is now retried automatically instead of leaving
+market data UNAVAILABLE forever. Verified:
+- Mock: fails once then succeeds (2 attempts), fails twice then succeeds
+  (3 attempts), and a sustained-failure case that keeps retrying past the
+  end of the backoff table without ever giving up.
+- Real: not re-triggered in the final real test (see "REAL TEST" below --
+  the one real startup this session succeeded on the first attempt, so
+  the retry PATH itself was exercised only by the 9 mocked tests, which
+  use the exact same production code, not a reimplementation).
+
+------------------------------------------------------------
+2. RETRY BACKOFF -- PASS
+------------------------------------------------------------
+
+test_backoff_sequence_matches_the_documented_schedule asserts the exact
+sequence [2, 4, 8, 16, 30, 30] for 6 consecutive failures -- matching the
+requested schedule exactly and confirming it holds at the 30s maximum
+rather than growing further or resetting.
+
+------------------------------------------------------------
+3. SHUTDOWN HANDLING -- PASS
+------------------------------------------------------------
+
+`_StartupRetrySupervisor.stop()` sets a stop event AND cancels the retry
+task directly, then awaits it to completion -- verified the task is
+fully gone (not just marked done) and issues no further connection
+attempts after stop() returns, even mid-backoff. `stop_market_data_ws()`
+calls this before disconnecting market_ws itself, so FastAPI shutdown
+cleanly tears down a still-retrying startup attempt.
+
+------------------------------------------------------------
+4. NO DUPLICATE RETRY LOOPS -- PASS
+------------------------------------------------------------
+
+Calling `start()` while already running is a no-op (logged, not silently
+ignored) -- verified the second call never creates a second task; the
+original task object is unchanged. Only a successful connect() ever
+reaches CoinDCXMarketDataWebSocket._on_connect (where subscriptions
+happen), and a failed retry attempt never reaches it at all -- so retries
+can structurally never cause a duplicate subscription either.
+
+------------------------------------------------------------
+5. EXISTING RECONNECT -- PASS
+------------------------------------------------------------
+
+test_existing_reconnect_still_works_after_a_supervisor_driven_startup
+drives the real process-wide market_ws singleton through
+start_market_data_ws() (the new supervisor path) to a successful first
+connect, then simulates a SUBSEQUENT real drop and recovery purely via
+market_ws's own existing _on_disconnect/_on_connect handlers -- proving
+the supervisor leaves the singleton in exactly the state a direct
+connect() always did, with correct DISCONNECTED -> LIVE transitions and
+resubscription, never re-entering the supervisor.
+
+------------------------------------------------------------
+6. TELEGRAM DEDUP -- PASS
+------------------------------------------------------------
+
+Failed retries never call _on_connect/_on_disconnect at all, so they
+structurally cannot fire an alert (requirement: "do not send repeated
+Telegram alerts for every failed startup retry"). The eventual first
+successful connect is also correctly treated as a baseline, not a
+"recovery" (pre-existing, unmodified behavior) -- so it doesn't alert
+either. test_telegram_alerts_not_duplicated_by_startup_retries drives a
+real fail-fail-succeed sequence through the real market_ws singleton and
+asserts zero TelegramBot.send_market_data_alert calls across all three
+attempts.
+
+------------------------------------------------------------
+7. SECURITY / NO-ORDER -- PASS
+------------------------------------------------------------
+
+Full security suite re-run: 6/6 in test_no_order_placement_capability.py
+(including two new checks -- one confirming _StartupRetrySupervisor takes
+no credentials of its own and exposes only start/stop/is_running, and the
+pre-existing WebSocket-credential-free-constructor check) plus the
+existing credential-logging tests, all passing. Verified no credential
+value or name appears in the new retry log lines (mocked-logger test
+asserting no "api_key"/"api_secret"/"token" substrings in any retry log
+call).
+
+------------------------------------------------------------
+DO-NOT-CHANGE LIST -- CONFIRMED UNTOUCHED
+------------------------------------------------------------
+
+Only services/market_data/live_state.py and its two test files were
+modified. Not touched: the Donchian+ADX strategy, any signal threshold,
+the risk engine, position sizing, the CoinDCX account P&L path (REST
+sync, still separate from this WebSocket), the INR conversion pipeline,
+any frontend file, any Telegram message template (send_market_data_alert
+itself is unmodified -- only when/how often it's called was ever in
+scope, and that was already correct), and the order-security
+restrictions (extended, not loosened).
+
+------------------------------------------------------------
+REGRESSION
+------------------------------------------------------------
+
+Backend: 440 passed, 1 skipped, 0 failed (+12 vs. the pre-change 428/1 --
+9 in tests/unit/test_market_data_startup_retry.py, 2 in
+tests/integration/test_live_market_data_flow.py, 1 in
+tests/unit/test_no_order_placement_capability.py). Zero existing tests
+weakened or deleted.
+Frontend: 16 passed, 0 failed -- unchanged, no frontend file touched.
+TypeScript: clean, 0 errors.
+
+------------------------------------------------------------
+REAL TEST
+------------------------------------------------------------
+
+Real WebSocket startup: PASS. Restarted the local backend
+(uvicorn apps.api.main:app) with the new code and MARKET_DATA_WS_ENABLED=
+true. Startup logs:
+
+  CoinDCX live market-data WebSocket enabled
+  CoinDCX market-data WebSocket connected instrument=B-BTC_USDT
+  CoinDCX market-data WebSocket connected attempt=1
+
+The real connection succeeded on the first attempt (attempt=1 in the log
+confirms the new supervisor code path executed, not a bypass), so the
+retry path itself was not exercised by this real run -- only the happy
+path was. FastAPI startup was not blocked (health check responded within
+seconds). The dashboard immediately reflected real live data:
+market_data_status="LIVE", real btc_price_usdt=78432.1
+(₹77,93,013.46), real market_data_mark_price_usdt=78432.2. No exceptions
+and zero occurrences of the real API key value in the startup log
+(grepped directly, without printing it). The feed was left running only
+long enough to confirm LIVE state, per "do not intentionally leave the
+production feed disconnected for a long period" -- no real disconnect
+was forced this session, so the retry behavior's real-world trigger
+remains verified only via the 9 mocked tests (which exercise the actual
+production _StartupRetrySupervisor class, not a reimplementation).
+
+------------------------------------------------------------
+REMAINING PRODUCTION BLOCKERS
+------------------------------------------------------------
+
+1. The retry path's real-world trigger (an actual failed first connection
+   in production) was not observed again in this session -- it happened
+   once, unprompted, during the prior validation phase, and the fix was
+   verified against that same class via mocks plus a real happy-path
+   restart, not against a second real failure.
+2. Still a local dev process (uvicorn --host 127.0.0.1), not deployed to
+   the target persistent backend/worker topology.
+3. df-position-update/balance-update real-wire confirmation (Phase 5's
+   authenticated channel fix) remains inferred-but-unobserved for those
+   two specific event types, as already noted in the prior report --
+   unchanged by this session.
+4. ESLint remains unconfigured in this project (pre-existing, unrelated
+   to this change).
+5. No change was needed to, and none was made to, the soak-tested
+   reconnect-from-a-genuine-drop behavior -- that remains as validated in
+   the prior report (real induced drop, ~2s automatic recovery, no
+   duplicate subscriptions).
+
+No trading logic, signal thresholds, risk management, or position sizing
+was changed. No automatic trading capability exists or was added. Zero
+real orders were placed. No deployment was performed.
+
+============================================================
+DONE. Stopping here as instructed.
+DO NOT DEPLOY. DO NOT ENABLE AUTOMATIC TRADING.
+============================================================

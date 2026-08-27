@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 10% 4%;
+    --foreground: 240 5% 90%;
+    --card: 240 6% 7%;
+    --card-foreground: 240 5% 90%;
+    --primary: 142 71% 45%;
+    --secondary: 217 91% 60%;
+    --muted: 240 5% 12%;
+    --muted-foreground: 240 5% 55%;
+    --destructive: 0 84% 60%;
+    --border: 240 5% 15%;
+    --long: 142 71% 45%;
+    --short: 0 84% 60%;
+    --no-trade: 48 96% 53%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+@layer utilities {
+  .text-long {
+    @apply text-green-500;
+  }
+  .text-short {
+    @apply text-red-500;
+  }
+  .text-no-trade {
+    @apply text-yellow-500;
+  }
+  .bg-long {
+    @apply bg-green-500;
+  }
+  .bg-short {
+    @apply bg-red-500;
+  }
+  .bg-no-trade {
+    @apply bg-yellow-500;
+  }
+}
+
+.dashboard-card {
+  @apply bg-card rounded-xl border border-border p-4;
+}
+
+.stat-value {
+  @apply text-2xl font-bold font-mono;
+}
+
+.stat-label {
+  @apply text-sm text-muted-foreground uppercase tracking-wider;
+}

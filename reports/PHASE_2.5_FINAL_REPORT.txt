@@ -1,0 +1,293 @@
+============================================================
+ALPHAONE AI
+PHASE 2.5 FINAL VALIDATION
+============================================================
+
+1. CODE CHANGES
+------------------------------------------------------------
+- services/backtester/engine.py
+  - _resolve_stop_fill(): gap-through-stop now fills at the true gapped
+    price (bar's own open) when the market has moved past the stop before
+    the backtester can react, instead of the stale stop level.
+  - _apply_funding_events(): real, timestamp-aligned historical funding,
+    charged event-by-event with the correct LONG/SHORT sign convention.
+    Falls back to the old flat-average estimate only when no funding
+    dataset is supplied.
+  - Backtester.run() gained an optional `funding_rates` parameter.
+- services/backtester/sanity_checks.py (new) -- automated impossible-result
+  detection (section 12).
+- services/backtester/regime_analysis.py (new) + services/signal_engine/
+  regime.py: detect_regime_series() -- vectorized regime detection, proven
+  to exactly match the existing scalar MarketRegimeDetector, used only for
+  read-only regime-bucketed reporting.
+- services/backtester/walk_forward_baselines.py (new) -- fold-by-fold
+  walk-forward runner for the four RULE-BASED baselines (no ML, no fitting).
+- ml/evaluation/baselines.py, ml/evaluation/validator.py, scripts/run_backtest.py,
+  scripts/run_baselines.py: wired real historical funding through end to end.
+- Dataset: 1h/4h/15m/5m/1d extended from 1yr to 3yr; 1m left at 1yr (see
+  section 3).
+- docs/execution_semantics.md, docs/exchange_assumptions.md,
+  docs/data_quality.md, docs/known_limitations.md updated.
+- Tests added: test_gap_through_stop.py (5), test_funding.py (10),
+  test_backtest_reconciliation.py (7), test_sanity_checks.py (13), plus
+  vectorized-regime parity tests in test_regime.py (2).
+
+2. CRITICAL FIXES
+------------------------------------------------------------
+(1) Gap-through-stop -- verified with the spec's exact examples:
+    LONG  SL=98,  next open=94  -> exit ~94  (was 98)
+    SHORT SL=102, next open=106 -> exit ~106 (was 102)
+    Normal (non-gapped) stop touches still fill at the stop level, unchanged.
+
+(2) Real historical funding -- hand-calculated and verified both directions:
+    $10,000 notional, rate=0.01% -> $1.00 funding cost.
+    LONG + positive rate  -> pays   (cost +$1.00)
+    LONG + negative rate  -> receives (cost -$1.00)
+    SHORT + negative rate -> pays   (cost +$1.00)
+    SHORT + positive rate -> receives (cost -$1.00)
+    Point-in-time correct: entry-exactly-at-funding-timestamp is not
+    charged; positions closed before a funding event are not charged;
+    positions spanning multiple events are charged for each; a funding
+    rate dated after the dataset's end is never used.
+
+3. DATASET
+------------------------------------------------------------
+Symbol: BTC/USDT perpetual (Binance, live public API, no credentials)
+
+  Timeframe   Coverage period                  Rows
+  1m          2025-08-26 -> 2026-08-26 (1yr)    525,600
+  5m          2023-08-27 -> 2026-08-26 (3yr)    315,360
+  15m         2023-08-27 -> 2026-08-26 (3yr)    105,120
+  1h          2023-08-27 -> 2026-08-26 (3yr)    26,280
+  4h          2023-08-27 -> 2026-08-26 (3yr)    6,570
+  1d          2023-08-28 -> 2026-08-26 (3yr)    1,095
+
+1m deliberately kept at 1 year (not extended) -- the brief explicitly said
+not to let a large 1m download block the rest of the work, and the
+incremental research value of 3yr @ 1m (~1.5M extra rows) was judged not
+worth the time versus the priority timeframes.
+
+While extending the dataset, TWO more historical-backfill bugs (beyond the
+Phase 2 audit's original list) were found and fixed: DataIngestionService
+.backfill() and .backfill_funding_rates() both silently skipped historical
+data older than a small pre-existing "island" of already-ingested rows
+(from an earlier smoke-test download), instead of also filling that earlier
+gap. Caught before it corrupted the extended dataset; regression tests added
+(tests/integration/test_ingestion.py).
+
+4. DATA QUALITY
+------------------------------------------------------------
+Every timeframe: 100% coverage, 0 missing rows, 0 duplicates, 0 out-of-order
+rows, 0 invalid OHLC rows, not stale. Full JSON reports in reports/
+data_quality_BTC-USDT_*.json. No interpolation, no silent repair -- this is
+a genuinely clean pull from Binance.
+
+5. FUNDING COVERAGE
+------------------------------------------------------------
+3,285 real funding-rate records, 2023-08-27 -> 2026-08-26 (3 years x 3
+events/day = 3,285 exactly -- no gaps). Stored separately in the
+funding_rates table, timestamp-ordered, no duplicates (unique constraint
+on symbol+timestamp), used directly by the backtester wherever available.
+
+6. OPEN INTEREST COVERAGE
+------------------------------------------------------------
+567 records, 2026-07-27 -> 2026-08-26 (~30 days) -- Binance's public API
+limit, confirmed unchanged from Phase 2, not fabricated beyond it.
+Historical liquidations: still not available through any public Binance
+endpoint (fetchLiquidations raises NotSupported) -- 0 records, honestly
+reported, not faked.
+
+7. BACKTESTER VALIDATION
+------------------------------------------------------------
+- 7 hand-computed reconciliation scenarios (winning/losing LONG/SHORT,
+  funding-in-combination, gap-through-stop, fee calculation) -- engine
+  output matches manual arithmetic exactly in every case
+  (tests/unit/test_backtest_reconciliation.py).
+- 13 automated sanity checks (profit factor, win rate range, drawdown sign,
+  final-capital-vs-equity-curve reconciliation, fee sign, funding
+  composition, trade-count consistency, exit-after-entry, position-size
+  sign, leverage limit, unexplained equity jumps) -- all pass on real
+  results; each check independently proven to catch its named corruption
+  (tests/unit/test_sanity_checks.py). Wired into scripts/run_backtest.py:
+  a failing check now REFUSES to generate a report rather than printing a
+  misleading one.
+- Gap-through-stop and simultaneous-SL/TP behavior re-verified after the
+  fix; adversarial cases (empty dataset, single-bar dataset, extreme
+  volatility, duplicate-entry prevention, risk-limit exhaustion) still pass.
+
+8. BASELINE RESULTS (continuous single-pass backtests)
+------------------------------------------------------------
+IMPORTANT CAVEAT (see section 14): every continuous run below stopped
+generating new trades within the first 5-8 weeks of the 3-year window due
+to the pre-existing (unfixed, see section 14) kill-switch lockout bug. The
+"3-year" label on these runs is accurate for the DATA period but NOT for
+how much of it each strategy was actually exposed to. Treat section 9
+(walk-forward) as the trustworthy multi-period read; these numbers are
+included for completeness and transparency, not as the headline result.
+
+1h (26,280 candles, 2023-08-27 -> 2026-08-26):
+  Strategy          Trades  WinRate  PF       Sharpe  MaxDD   NetReturn
+  Buy & Hold        1       100%     13517.35 0.00    0.0%    +135.17%  (reflects BTC's price move, not strategy skill)
+  EMA 9/21          25      48.0%    1.15     0.26    1.69%   +1.11%
+  RSI 14            3       33.3%    0.67     -0.16   1.08%   -0.36%
+  Donchian+ADX      25      48.0%    1.16     0.27    1.87%   +1.11%
+
+4h (6,570 candles):
+  Buy & Hold        1       100%     13460.79 0.00    0.0%    +134.61%
+  EMA 9/21          1       0.0%     0.00     -0.58   0.50%   -0.50%
+  RSI 14            2       50.0%    1.34     0.12    0.53%   +0.18%
+  Donchian+ADX      5       20.0%    0.34     -0.68   1.57%   -1.38%
+
+15m (105,120 candles) -- more trades survived before lockout at this
+resolution:
+  Buy & Hold        1       100%     13457.56 0.00    0.0%    +134.58%
+  EMA 9/21          40      42.5%    0.78     -0.27   3.34%   -2.45%
+  RSI 14            31      35.5%    0.55     -1.06   7.02%   -4.84%
+  Donchian+ADX      76      43.4%    0.77     -0.75   7.67%   -4.91%
+
+9. WALK-FORWARD RESULTS (the trustworthy multi-period signal -- each fold
+   uses a FRESH risk engine, immune to the section-14 lockout bug)
+------------------------------------------------------------
+1h, 24 folds (~3-week train / ~3-week test windows, embargo=50 bars):
+  EMA 9/21:      12/24 profitable, mean return +0.13%, range -2.18% to +2.82%
+  RSI 14:         7/24 profitable, mean return -0.41%, range -2.83% to +3.78%
+  Donchian+ADX:   9/24 profitable, mean return +0.38%, range -2.74% to +4.97%
+
+4h, 24 folds (~3-week train / ~5-day test windows, embargo=20 bars):
+  EMA 9/21:      12/24 profitable, mean return +0.06%, range -0.55% to +1.53%
+  RSI 14:         9/24 profitable, mean return -0.15%, range -1.39% to +1.31%
+  Donchian+ADX:  15/24 profitable, mean return +0.50%, range -0.53% to +5.22%
+
+Full per-fold detail: reports/walk_forward_baselines_report.txt
+
+10. REGIME ANALYSIS (exploratory only, 1h, continuous-run trades --
+    inherits the small-sample caveat from section 14)
+------------------------------------------------------------
+EMA Crossover (25 trades total): HIGH_VOLATILITY 7 trades/PF 3.08,
+  TRENDING_BULLISH 5/PF 0.31, TRENDING_BEARISH 3/PF 206 (single large win),
+  UNCERTAIN 3/PF 0, BREAKOUT 3/PF 0.59, RANGING 2/PF 1.28, LOW_VOL 2/PF 1.47.
+RSI (3 trades total): far too few to bucket meaningfully.
+Trend Following (25 trades total): HIGH_VOLATILITY 11/PF 1.52,
+  TRENDING_BULLISH 7/PF 0.92, TRENDING_BEARISH 6/PF 1.23, BREAKOUT 1/PF 0.
+
+Every bucket has under 30 trades (most under 10) -- NONE of this supports
+a statistical conclusion about regime-dependent performance. It is
+recorded because the brief asked for it, not because it is decision-grade.
+
+11. LEAKAGE TESTS
+------------------------------------------------------------
+All Phase 2 leakage tests re-verified against the extended dataset and
+new code paths -- still passing: truncation-invariance across the full
+feature engine, deliberate-corruption detection (proves the detector isn't
+vacuous), label leakage, chronological-split/embargo checks, scaling
+guard-rail, and execution-timing (now including the gap-through-stop fix).
+No leakage introduced by the funding event-application logic: funding
+timestamps strictly later than the dataset's last processed bar are never
+used (tests/unit/test_funding.py::test_no_lookahead_future_funding_rate_is_never_used).
+
+12. SANITY CHECKS
+------------------------------------------------------------
+13 checks implemented and passing on all real results generated in this
+phase; each was verified to actually catch its corresponding corruption
+(not just pass on clean data). See section 7.
+
+13. TEST RESULTS
+------------------------------------------------------------
+Passed:  124
+Failed:  0
+Skipped: 0
+(up from 87 at the end of Phase 2; full run: `pytest tests/ -v`)
+
+14. KNOWN LIMITATIONS
+------------------------------------------------------------
+CRITICAL, discovered this phase, NOT fixed (flagged for follow-up):
+  The risk-engine kill switch never auto-resets once tripped. Confirmed
+  every baseline's continuous 3-year backtest actually stopped trading in
+  Aug-Oct 2023 (within the first 5-8 weeks) and stayed locked out for the
+  remaining ~2.9 years. This makes the section-8 continuous-run numbers
+  NOT representative of 3-year behavior -- use section 9 (walk-forward,
+  immune to this bug) as the credible multi-period evidence instead. Not
+  fixed here because it wasn't one of the two issues this phase was
+  scoped to fix, and the right reset policy (daily reset vs. hard stop vs.
+  configurable) deserves deliberate design, not a reactive patch.
+
+Carried over from Phase 2 (see docs/known_limitations.md for full list):
+  OI capped at ~30 days, no historical liquidations, no TP2/TP3/partial
+  exits, exchange fee/slippage values are labeled assumptions, take-profit
+  doesn't get the same gap-aware fill logic as stop-loss, Garman-Klass
+  volatility can produce NaN on some bars, no scaler in the ML pipeline
+  (none needed for tree models).
+
+15. INTERPRETATION
+------------------------------------------------------------
+- Sample sizes are generally small (1-25 trades per continuous run per
+  timeframe/strategy; 24 folds of a handful of trades each in walk-forward).
+  None of this rises to statistical significance in a formal sense -- no
+  significance test was run, and none should be claimed.
+- Where a mean walk-forward return is positive (EMA and Donchian+ADX, both
+  timeframes), it is small (+0.06% to +0.50% per ~3-5 week fold) relative
+  to the spread across folds (up to +5.22%/-2.74%), meaning results are
+  NOT stable fold-to-fold -- a handful of large winning folds visibly pull
+  the mean up while the MAJORITY of individual folds for trend-following
+  are still negative (9/24 and 15/24 profitable respectively -- i.e. even
+  the "best" result has more losing folds than winning ones at 1h).
+- Transaction costs are material: fees alone ran $100-$550 against
+  $10,000 accounts across these runs -- a meaningful share of any modest
+  edge, consistent with these being high-frequency-ish mechanical rules
+  trading noise more than a real signal.
+- RSI is the most consistently negative across every cut (continuous runs,
+  both walk-forward timeframes, all leaning loss-making).
+- Buy-and-hold's continuous-run number (+135%) reflects BTC's price
+  appreciation over this specific 3-year window, not strategy skill, and
+  should not be read as "buy-and-hold beats the baselines" in any
+  risk-adjusted sense -- it carries the full drawdown of the underlying
+  asset with no risk management at all.
+- The kill-switch bug (section 14) means the continuous-run trade counts
+  and "stability across timeframes" cannot be assessed from section 8
+  alone -- section 9's walk-forward folds are the only results in this
+  report immune to that confound, and even those show no strategy with a
+  convincingly stable, cost-surviving edge.
+
+16. RECOMMENDATION FOR PHASE 3
+------------------------------------------------------------
+1. Is the backtester trustworthy? Mostly yes, with one important caveat.
+   Execution timing, fees, slippage, gap-through-stop, and funding all now
+   reconcile exactly against hand-calculated scenarios, and 13 automated
+   sanity checks + the full leakage suite pass. The one real trust gap is
+   the kill-switch lockout (section 14): CONTINUOUS multi-year backtests
+   are not currently trustworthy for strategies that can trip a
+   daily-loss/drawdown limit early. WALK-FORWARD backtests are trustworthy
+   today because each fold resets risk state.
+2. Are the baseline results stable? No. Walk-forward shows roughly
+   coin-flip fold-level outcomes for every strategy, with wide dispersion
+   (multi-percent swings both directions per fold) and no strategy
+   clearing 50%+ profitable folds convincingly across both tested
+   timeframes.
+3. Are any baselines showing a potentially meaningful edge? Donchian+ADX
+   trend-following is the closest thing to a positive signal (positive
+   mean walk-forward return on both 1h and 4h, and 15/24 profitable folds
+   at 4h) but this is NOT verified as a real edge -- it is one strategy,
+   two timeframes, driven partly by a few large winning folds, with no
+   significance test applied. It should be treated as "worth a closer,
+   dedicated look" -- not as a finding.
+4. What weaknesses remain? The kill-switch lockout (critical, flagged as
+   a follow-up task); no TP2/TP3/partial exits; take-profit gap handling
+   asymmetric with stop-loss; OI/liquidation history limited by the
+   exchange, not the code; small trade counts throughout that limit any
+   statistical claim.
+5. Is the foundation ready for ML research? For LEAKAGE and EXECUTION
+   correctness: yes -- the data pipeline, feature engine, and backtester
+   have survived adversarial and reconciliation testing at a level that
+   should be trustworthy input for a model. For BACKTESTING a trained
+   model over long historical windows: not yet -- the kill-switch issue
+   should be resolved first, or Phase 3 must exclusively evaluate models
+   via the walk-forward path (which is already unaffected) rather than
+   any continuous multi-year run.
+
+FINAL RULE, ANSWERED HONESTLY: No baseline demonstrates a verified,
+cost-surviving statistical edge. Buy-and-hold's large continuous-run
+number is the underlying asset's price move, not a strategy result.
+Donchian+ADX trend-following is the one strategy worth a closer, dedicated
+look in Phase 3 -- but it is reported here as "worth investigating,"
+not as "found an edge."
+============================================================

@@ -1,0 +1,8 @@
+===== WALK-FORWARD: 1h =====
+Aggregate: 24 folds, 11 profitable, mean return=0.04%, min=-3.78%, max=3.91%
+Aggregate: 24 folds, 9 profitable, mean return=-0.81%, min=-4.64%, max=3.67%
+Aggregate: 24 folds, 10 profitable, mean return=0.26%, min=-4.75%, max=5.12%
+===== WALK-FORWARD: 4h =====
+Aggregate: 24 folds, 13 profitable, mean return=0.07%, min=-2.19%, max=1.50%
+Aggregate: 24 folds, 12 profitable, mean return=-0.13%, min=-1.95%, max=1.29%
+Aggregate: 24 folds, 18 profitable, mean return=0.61%, min=-1.57%, max=4.78%
