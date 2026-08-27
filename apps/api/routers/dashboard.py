@@ -111,9 +111,20 @@ async def get_dashboard(db: AsyncSession = Depends(get_db)):
         "current_signal": latest_signal.signal_type if latest_signal else None,
         "signal_quality": latest_signal.quality if latest_signal else None,
         "market_regime": latest_signal.market_regime if latest_signal else None,
+        # USDT is the primary/authoritative trading denomination (actual
+        # CoinDCX BTC/USDT Perpetual execution levels) -- INR (_inr fields)
+        # is only the secondary converted representation. Never omit the
+        # USDT levels even when the INR conversion is unavailable.
+        "signal_entry_price": latest_signal.entry_price if latest_signal else None,
+        "signal_stop_loss": latest_signal.stop_loss if latest_signal else None,
+        "signal_take_profit_1": latest_signal.take_profit_1 if latest_signal else None,
+        "signal_take_profit_2": latest_signal.take_profit_2 if latest_signal else None,
+        "signal_take_profit_3": latest_signal.take_profit_3 if latest_signal else None,
         "signal_entry_price_inr": convert_usdt_to_inr(latest_signal.entry_price, rate) if latest_signal else None,
         "signal_stop_loss_inr": convert_usdt_to_inr(latest_signal.stop_loss, rate) if latest_signal else None,
         "signal_take_profit_1_inr": convert_usdt_to_inr(latest_signal.take_profit_1, rate) if latest_signal else None,
+        "signal_take_profit_2_inr": convert_usdt_to_inr(latest_signal.take_profit_2, rate) if latest_signal else None,
+        "signal_take_profit_3_inr": convert_usdt_to_inr(latest_signal.take_profit_3, rate) if latest_signal else None,
         "signal_risk_reward": latest_signal.risk_reward if latest_signal else None,
         "open_positions": len(open_positions),
         "unrealized_pnl": unrealized_pnl,

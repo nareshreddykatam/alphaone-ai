@@ -1,13 +1,28 @@
-import { formatINR } from "@/lib/currency"
+import { formatINR, formatUSDT } from "@/lib/currency"
 
 interface SignalDisplayProps {
   signal: string | null
   regime: string | null
+  entryUsdt?: number | null
+  slUsdt?: number | null
+  tp1Usdt?: number | null
   entryInr?: number | null
   slInr?: number | null
   tp1Inr?: number | null
   rr?: number | null
   quality?: string | null
+}
+
+// USDT is the actual BTC/USDT Perpetual trading level (primary); INR is
+// the secondary converted representation, shown only when available --
+// never invented in its place.
+function Level({ usdt, inr, className }: { usdt?: number | null; inr?: number | null; className?: string }) {
+  return (
+    <>
+      <p className={`font-mono font-bold ${className || ""}`}>{formatUSDT(usdt)}</p>
+      <p className="text-xs font-mono text-muted-foreground">{inr != null ? `≈ ${formatINR(inr)}` : ""}</p>
+    </>
+  )
 }
 
 const QUALITY_STYLES: Record<string, string> = {
@@ -16,7 +31,9 @@ const QUALITY_STYLES: Record<string, string> = {
   LOW: "text-muted-foreground",
 }
 
-export function SignalDisplay({ signal, regime, entryInr, slInr, tp1Inr, rr, quality }: SignalDisplayProps) {
+export function SignalDisplay({
+  signal, regime, entryUsdt, slUsdt, tp1Usdt, entryInr, slInr, tp1Inr, rr, quality,
+}: SignalDisplayProps) {
   const signalColor =
     signal === "LONG"
       ? "bg-long"
@@ -37,15 +54,15 @@ export function SignalDisplay({ signal, regime, entryInr, slInr, tp1Inr, rr, qua
         <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
           <div>
             <p className="stat-label">Entry</p>
-            <p className="font-mono font-bold">{formatINR(entryInr)}</p>
+            <Level usdt={entryUsdt} inr={entryInr} />
           </div>
           <div>
             <p className="stat-label">Stop Loss</p>
-            <p className="font-mono font-bold text-short">{formatINR(slInr)}</p>
+            <Level usdt={slUsdt} inr={slInr} className="text-short" />
           </div>
           <div>
             <p className="stat-label">Take Profit</p>
-            <p className="font-mono font-bold text-long">{formatINR(tp1Inr)}</p>
+            <Level usdt={tp1Usdt} inr={tp1Inr} className="text-long" />
           </div>
           <div>
             <p className="stat-label">Risk/Reward</p>

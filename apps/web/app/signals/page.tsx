@@ -3,12 +3,23 @@
 import { useState, useEffect } from "react"
 import { Navigation } from "@/components/Navigation"
 import { parseUtcDate } from "@/lib/time"
-import { formatINR } from "@/lib/currency"
+import { formatINR, formatUSDT } from "@/lib/currency"
 
 const QUALITY_STYLES: Record<string, string> = {
   HIGH: "text-long",
   MEDIUM: "text-no-trade",
   LOW: "text-muted-foreground",
+}
+
+// USDT is the actual BTC/USDT Perpetual trading level (primary); INR is
+// the secondary converted representation, shown only when available.
+function PriceCell({ usdt, inr, hasConversion, className }: { usdt: number | null | undefined; inr: number | null | undefined; hasConversion: boolean; className?: string }) {
+  return (
+    <div className={className}>
+      <p className="font-mono">{formatUSDT(usdt)}</p>
+      {hasConversion && inr != null && <p className="font-mono text-xs text-muted-foreground">≈ {formatINR(inr)}</p>}
+    </div>
+  )
 }
 
 export default function SignalsPage() {
@@ -54,11 +65,10 @@ export default function SignalsPage() {
             <p className="text-muted-foreground text-sm">
               Research signals -- LOW/MEDIUM/HIGH quality, not a validated accuracy claim.
             </p>
-            {signals[0]?.conversion_source && (
-              <p className="text-muted-foreground text-xs mt-1">
-                Prices shown in INR via {signals[0].conversion_source} ({signals[0].conversion_status})
-              </p>
-            )}
+            <p className="text-muted-foreground text-xs mt-1">
+              Levels shown in USDT (actual CoinDCX trading price)
+              {signals[0]?.conversion_source && ` with INR via ${signals[0].conversion_source} (${signals[0].conversion_status})`}
+            </p>
           </div>
           <button
             onClick={generateSignal}
@@ -84,6 +94,8 @@ export default function SignalsPage() {
                   <th className="py-2 pr-4">Entry</th>
                   <th className="py-2 pr-4">SL</th>
                   <th className="py-2 pr-4">TP1</th>
+                  <th className="py-2 pr-4">TP2</th>
+                  <th className="py-2 pr-4">TP3</th>
                   <th className="py-2 pr-4">R:R</th>
                   <th className="py-2 pr-4">Regime</th>
                   <th className="py-2 pr-4">Strategy</th>
@@ -106,9 +118,18 @@ export default function SignalsPage() {
                     <td className={`py-2 pr-4 font-mono ${s.quality ? QUALITY_STYLES[s.quality] : ""}`}>
                       {s.quality || "--"}
                     </td>
-                    <td className="py-2 pr-4 font-mono">{s.conversion_status && s.conversion_status !== "UNAVAILABLE" ? formatINR(s.entry_price_inr) : "N/A"}</td>
-                    <td className="py-2 pr-4 font-mono text-short">{s.conversion_status && s.conversion_status !== "UNAVAILABLE" ? formatINR(s.stop_loss_inr) : "N/A"}</td>
-                    <td className="py-2 pr-4 font-mono text-long">{s.conversion_status && s.conversion_status !== "UNAVAILABLE" ? formatINR(s.take_profit_1_inr) : "N/A"}</td>
+                    {(() => {
+                      const hasConversion = !!s.conversion_status && s.conversion_status !== "UNAVAILABLE"
+                      return (
+                        <>
+                          <td className="py-2 pr-4"><PriceCell usdt={s.entry_price} inr={s.entry_price_inr} hasConversion={hasConversion} /></td>
+                          <td className="py-2 pr-4"><PriceCell usdt={s.stop_loss} inr={s.stop_loss_inr} hasConversion={hasConversion} className="text-short" /></td>
+                          <td className="py-2 pr-4"><PriceCell usdt={s.take_profit_1} inr={s.take_profit_1_inr} hasConversion={hasConversion} className="text-long" /></td>
+                          <td className="py-2 pr-4"><PriceCell usdt={s.take_profit_2} inr={s.take_profit_2_inr} hasConversion={hasConversion} className="text-long" /></td>
+                          <td className="py-2 pr-4"><PriceCell usdt={s.take_profit_3} inr={s.take_profit_3_inr} hasConversion={hasConversion} className="text-long" /></td>
+                        </>
+                      )
+                    })()}
                     <td className="py-2 pr-4 font-mono">{s.risk_reward ? `1:${s.risk_reward}` : "--"}</td>
                     <td className="py-2 pr-4 font-mono text-xs">{s.market_regime || "--"}</td>
                     <td className="py-2 pr-4 text-xs">{s.strategy_name || "--"}</td>

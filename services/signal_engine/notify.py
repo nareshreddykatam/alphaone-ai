@@ -20,8 +20,9 @@ def _serialize_for_telegram(signal: Signal) -> dict:
         "signal_id": signal.signal_id, "signal_type": signal.signal_type,
         "quality": signal.quality, "entry_price": signal.entry_price,
         "stop_loss": signal.stop_loss, "take_profit_1": signal.take_profit_1,
+        "take_profit_2": signal.take_profit_2, "take_profit_3": signal.take_profit_3,
         "risk_reward": signal.risk_reward, "market_regime": signal.market_regime,
-        "reasoning": signal.reasoning,
+        "reasoning": signal.reasoning, "strategy_name": signal.strategy_name,
     }
 
 

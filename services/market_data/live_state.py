@@ -24,6 +24,18 @@ holding at 30s); the moment that first connect succeeds, this
 supervisor's job is done and every subsequent drop/reconnect is handled
 entirely by CoinDCXMarketDataWebSocket's own existing (unmodified)
 python-socketio reconnection -- never re-entered by this supervisor.
+
+live_candle_aggregator (added for the Live Chart's forming-candle display,
+audited after real evidence showed the chart's latest bar could sit up to
+5h40m stale -- the dashboard price was already live via `market_ws`
+directly, but the chart never consumed it at all): a SINGLE, shared
+LiveCandleAggregator instance, timeframe-matched to the validated 4h
+strategy. Shared (not duplicated) between apps/api/routers/market.py's
+/candles endpoint (feeds it a tick on every request, for chart display)
+and services/scheduler/runner.py's live_breakout_job (feeds it a tick
+every 30s, for signal detection) -- both read/write the SAME forming-bar
+state, so the chart and the live signal path can never disagree about
+what "the current forming 4h candle" looks like.
 """
 import asyncio
 from typing import Optional
@@ -33,6 +45,7 @@ import structlog
 from database.schema import async_session
 from database.schema.models import ConnectionState, SyncEvent, SyncStatus
 from services.market_data.coindcx_ws import CoinDCXMarketDataWebSocket
+from services.signal_engine.live_breakout import LiveCandleAggregator
 
 logger = structlog.get_logger()
 
@@ -62,6 +75,11 @@ async def _on_connection_transition(old_status: ConnectionState, new_status: Con
 
 
 market_ws = CoinDCXMarketDataWebSocket(on_state_change=_on_connection_transition)
+
+# Shared forming-candle state -- see module docstring. Fixed at 4h to
+# match the validated strategy timeframe; not per-chart-tab (15m/1h/1d
+# tabs keep showing only completed historical candles, unchanged).
+live_candle_aggregator = LiveCandleAggregator(timeframe="4h")
 
 
 async def _default_wait_or_stop(stop_event: asyncio.Event, timeout: float) -> None:

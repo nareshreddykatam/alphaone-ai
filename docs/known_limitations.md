@@ -1,6 +1,78 @@
-# Known limitations (Phase 2 + Phase 2.5 + Phase 2.6 + Phase 3 + Phase 4 + Phase 5 + INR-only UI + Live Market Data + Live Breakout Signals)
+# Known limitations (Phase 2 + Phase 2.5 + Phase 2.6 + Phase 3 + Phase 4 + Phase 5 + INR-only UI + Live Market Data + Live Breakout Signals + Live Price/Signal audit)
 
 Documented explicitly rather than left to be discovered later.
+
+## Live Price + Live Signal audit (USDT primary / INR secondary, Live Chart)
+
+- **UI reversed from "INR-only" to "USDT primary, INR secondary."** The
+  actual CoinDCX trading instrument (BTC/USDT Perpetual Futures) is quoted
+  in USDT -- the dashboard's BTC price card, the Live Chart's price axis,
+  Signal entry/SL/TP1/TP2/TP3, the Signals table, and Telegram alerts now
+  all show the USDT level as the primary value with "≈ ₹..." INR shown
+  underneath as the converted representation, never the reverse. Account
+  equity/available balance/used margin/unrealized P&L/daily P&L and the
+  manual Trade Journal remain INR-only, unchanged -- those are genuinely
+  INR-native (the CoinDCX account itself is INR-margined), not a USDT
+  price being displayed. `services/common/currency.py: format_usdt` and
+  `apps/web/lib/currency.ts: formatUSDT` are the new formatters backing
+  this; both return `"N/A"` for `None`/`NaN` rather than inventing a value.
+- **Root cause re-confirmed with fresh evidence: `B-BTC_USDT` (not
+  `B-BTC_INR`) remains the correct live-price instrument.** A direct real
+  call to `https://public.coindcx.com/market_data/v3/current_prices/
+  futures/rt` during this audit returned a full live payload for
+  `B-BTC_USDT` and `None` for `B-BTC_INR` -- matching an earlier session's
+  finding (a real WS connection received 0 ticks for `B-BTC_INR` in 25s
+  vs. 80-142 for `B-BTC_USDT`). Switching the live tick to `B-BTC_INR`
+  would not just be a cosmetic cross-venue basis difference -- it would
+  create a literal currency-unit mismatch against the USDT-denominated
+  Binance historical Donchian channel the forming candle is spliced onto.
+- **Real bug found and fixed: the Live Chart's `time` field silently
+  applied the server's LOCAL timezone instead of UTC.**
+  `apps/api/routers/market.py` used `int(dt.timestamp())` on values that
+  are always naive UTC (every `DateTime` column in
+  `database/schema/models.py` is naive, populated via `datetime.utcnow()`)
+  -- but `datetime.timestamp()` on a naive value assumes the *local*
+  system timezone. On this dev machine (IST, UTC+5:30, confirmed via
+  `time.timezone`), a genuine `08:00:00 UTC` candle bucket was serialized
+  as epoch `1787797800`, which decodes to `02:30:00 UTC` -- every bar's
+  reported chart position was silently shifted 5.5 hours earlier than
+  its real time. Fixed via a new `_epoch_seconds()` helper
+  (`calendar.timegm(dt.timetuple())`, which reads the naive value's
+  fields as UTC directly with no local-timezone conversion), applied to
+  all three call sites (historical candles, the live forming candle,
+  signal markers). Regression-tested independent of the test runner's own
+  timezone in `tests/unit/test_market_epoch_seconds.py`. This bug predates
+  this session's changes (it also affected the pre-existing historical
+  `"time"` field) but was only surfaced now because building the forming-
+  candle feature required reasoning precisely about bucket alignment.
+  Whether this manifests in production depends on the deployed
+  container's OS timezone (many default to UTC, in which case it was
+  silent there) -- not independently verified for the current Railway
+  deployment.
+- **A related, NOT-fixed risk found during the same investigation:
+  `DataIngestionService.backfill()` (`services/market_data/ingestion.py`)
+  does not filter out a still-forming (not yet closed) candle that ccxt/
+  Binance can return as the last page of `fetch_ohlcv` when the requested
+  window reaches "now."** Observed live: the most recently stored 4h
+  `Candle` row and the independently-computed live `forming_candle` for
+  the same open-time bucket disagreed (the stored row's `close` was a
+  mid-formation snapshot, not the bucket's true final close). This is a
+  pre-existing characteristic of the original Phase 1-3 ingestion
+  pipeline, not introduced by this session -- backtesting/walk-forward
+  research was never exposed to it (research always queries fully-closed
+  historical ranges, never `end=now()`), but `signal_generation_job`'s
+  15-minute closed-candle evaluation could in principle read such a row
+  before its true close. Not fixed here: doing so safely requires
+  auditing/adjusting the core candle-ingestion pipeline that the validated
+  strategy's data depends on, which is out of scope for a live-price/
+  live-chart display task and risks the "do not silently change anything
+  that could affect the validated strategy" instruction. The Live Chart's
+  own `forming_candle` field is unaffected in practice: the frontend
+  (`apps/web/app/chart/page.tsx`) detects when the live forming candle and
+  the last stored historical row share the same bucket time and displays
+  the live one in that bar's place, rather than erroring (lightweight-
+  charts requires strictly ascending, unique bar times) or showing the
+  possibly-incomplete stored value as if it were final.
 
 ## Live Breakout Signals (intrabar detection, still 4h Donchian+ADX)
 

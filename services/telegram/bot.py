@@ -21,7 +21,7 @@ import structlog
 from apps.api.config import get_settings
 from database.schema import async_session
 from database.schema.models import Signal
-from services.common.currency import format_inr
+from services.common.currency import format_inr, format_usdt
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
 from services.exchange.fx import get_usdt_inr_rate, convert_usdt_to_inr
 from services.portfolio.account import get_or_create_default_account
@@ -66,28 +66,39 @@ class TelegramBot:
         if signal_type == "NO_TRADE":
             return
 
-        # Signal price levels are USDT-denominated (Binance-sourced signal
-        # engine) -- convert to INR for display; never fabricate a value if
-        # the conversion rate is unavailable.
+        # BTC/USDT Perpetual is the actual CoinDCX trading instrument --
+        # USDT is the PRIMARY/authoritative trading denomination for every
+        # level below; INR is only the SECONDARY converted representation
+        # (never invented when the conversion rate is unavailable -- the
+        # USDT levels, which are what the user actually executes on
+        # CoinDCX, are always shown regardless of conversion availability).
         rate = await get_usdt_inr_rate()
-        entry_inr = format_inr(convert_usdt_to_inr(signal.get("entry_price"), rate))
-        sl_inr = format_inr(convert_usdt_to_inr(signal.get("stop_loss"), rate))
-        tp1_inr = format_inr(convert_usdt_to_inr(signal.get("take_profit_1"), rate))
-        if rate is None:
-            entry_inr = sl_inr = tp1_inr = "INR conversion unavailable"
+
+        def level(usdt_value):
+            usdt_line = format_usdt(usdt_value)
+            inr_line = format_inr(convert_usdt_to_inr(usdt_value, rate)) if rate is not None else "INR conversion unavailable"
+            return f"{usdt_line}\n≈ {inr_line}" if rate is not None else f"{usdt_line}\n({inr_line})"
 
         emoji = "🟢" if signal_type == "LONG" else "🔴"
+        tp_lines = [f"TP1:\n{level(signal.get('take_profit_1'))}"]
+        if signal.get("take_profit_2") is not None:
+            tp_lines.append(f"TP2:\n{level(signal.get('take_profit_2'))}")
+        if signal.get("take_profit_3") is not None:
+            tp_lines.append(f"TP3:\n{level(signal.get('take_profit_3'))}")
+
         text = (
-            f"🚨 ALPHAONE RESEARCH SIGNAL\n\n"
+            f"🚨 BTC/USDT PERPETUAL — {signal_type}\n\n"
             f"{emoji} {signal_type}\n\n"
-            f"BTC/USDT PERPETUAL\n\n"
+            f"Market:\nCoinDCX BTC/USDT Perpetual\n\n"
             f"Quality: {signal.get('quality', 'LOW')} (categorical, not an accuracy guarantee)\n\n"
-            f"Entry:\n{entry_inr}\n\n"
-            f"Stop Loss:\n{sl_inr}\n\n"
-            f"TP1:\n{tp1_inr}\n\n"
+            f"Entry:\n{level(signal.get('entry_price'))}\n\n"
+            f"Stop Loss:\n{level(signal.get('stop_loss'))}\n\n"
+            + "\n\n".join(tp_lines) + "\n\n"
             f"Risk/Reward:\n1 : {signal.get('risk_reward', 0)}\n\n"
             f"Market Regime:\n{signal.get('market_regime', 'UNKNOWN')}\n\n"
             f"Reason:\n{signal.get('reasoning', '')}\n\n"
+            f"Strategy:\n{signal.get('strategy_name', 'trend_following_donchian_adx')}\n\n"
+            f"Price source:\nCoinDCX Live Market Data\n\n"
             f"Signal ID:\n{signal.get('signal_id', 'unknown')}\n\n"
             f"MANUAL EXECUTION REQUIRED -- you execute this manually on CoinDCX, AlphaOne does not place orders."
         )
@@ -262,13 +273,19 @@ class TelegramBot:
             await update.message.reply_text("No signal has been generated yet.")
             return
         rate = await get_usdt_inr_rate()
-        entry_inr = format_inr(convert_usdt_to_inr(signal.entry_price, rate)) if rate else "INR conversion unavailable"
-        sl_inr = format_inr(convert_usdt_to_inr(signal.stop_loss, rate)) if rate else "INR conversion unavailable"
-        tp1_inr = format_inr(convert_usdt_to_inr(signal.take_profit_1, rate)) if rate else "INR conversion unavailable"
+
+        def level(usdt_value):
+            usdt_line = format_usdt(usdt_value)
+            if rate is None:
+                return f"{usdt_line} (INR conversion unavailable)"
+            return f"{usdt_line} (≈ {format_inr(convert_usdt_to_inr(usdt_value, rate))})"
+
         await update.message.reply_text(
             f"{signal.signal_type} ({signal.quality or 'LOW'} quality)\n"
             f"Regime: {signal.market_regime}\n"
-            f"Entry: {entry_inr}\nSL: {sl_inr}\nTP1: {tp1_inr}\n"
+            f"Entry: {level(signal.entry_price)}\n"
+            f"SL: {level(signal.stop_loss)}\n"
+            f"TP1: {level(signal.take_profit_1)}\n"
             f"{signal.reasoning}"
         )
 

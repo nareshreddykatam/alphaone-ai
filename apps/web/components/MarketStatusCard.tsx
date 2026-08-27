@@ -1,10 +1,11 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { formatINR, conversionStatusLabel } from "@/lib/currency"
+import { formatINR, formatUSDT, conversionStatusLabel } from "@/lib/currency"
 import { parseUtcDate } from "@/lib/time"
 
 interface MarketStatusCardProps {
+  priceUsdt: number | null | undefined
   priceInr: number | null | undefined
   markPriceUsdt: number | null | undefined
   status: string | null | undefined // LIVE / STALE / DISCONNECTED / UNAVAILABLE
@@ -31,7 +32,7 @@ function freshnessText(updatedAt: string | null | undefined, now: number): strin
 }
 
 export function MarketStatusCard({
-  priceInr, markPriceUsdt, status, source, updatedAt, conversionStatus, conversionRateUsdtInr,
+  priceUsdt, priceInr, markPriceUsdt, status, source, updatedAt, conversionStatus, conversionRateUsdtInr,
 }: MarketStatusCardProps) {
   const [now, setNow] = useState(() => Date.now())
 
@@ -41,8 +42,13 @@ export function MarketStatusCard({
   }, [])
 
   const config = STATUS_CONFIG[status || "UNAVAILABLE"] || STATUS_CONFIG.UNAVAILABLE
-  const priceText = conversionStatus && conversionStatus !== "UNAVAILABLE"
-    ? formatINR(priceInr)
+  // USDT is the actual CoinDCX BTC/USDT Perpetual trading price -- the
+  // PRIMARY value shown. INR is only the secondary converted
+  // representation, shown when a conversion rate is available; never
+  // shown (or invented) in place of the USDT price.
+  const hasUsdtPrice = priceUsdt != null
+  const inrText = conversionStatus && conversionStatus !== "UNAVAILABLE" && priceInr != null
+    ? `≈ ${formatINR(priceInr)}`
     : conversionStatusLabel(conversionStatus)
   const markPriceInr = markPriceUsdt != null && conversionRateUsdtInr != null
     ? markPriceUsdt * conversionRateUsdtInr
@@ -59,7 +65,8 @@ export function MarketStatusCard({
         </div>
       </div>
 
-      <p className="text-2xl font-bold font-mono mb-3">{priceText}</p>
+      <p className="text-2xl font-bold font-mono">{hasUsdtPrice ? formatUSDT(priceUsdt) : "N/A"}</p>
+      <p className="text-sm font-mono text-muted-foreground mb-3">{hasUsdtPrice ? inrText : ""}</p>
 
       <div className="grid grid-cols-2 gap-3 text-xs">
         <div>
@@ -70,10 +77,13 @@ export function MarketStatusCard({
           <p className="text-muted-foreground">Updated</p>
           <p className="font-mono">{freshness || "--"}</p>
         </div>
-        {markPriceInr != null && (
+        {markPriceUsdt != null && (
           <div className="col-span-2">
             <p className="text-muted-foreground">Mark Price</p>
-            <p className="font-mono">{formatINR(markPriceInr)}</p>
+            <p className="font-mono">
+              {formatUSDT(markPriceUsdt)}
+              {markPriceInr != null && <span className="text-muted-foreground"> &middot; ≈ {formatINR(markPriceInr)}</span>}
+            </p>
           </div>
         )}
       </div>

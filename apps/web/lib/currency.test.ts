@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { formatINR, conversionStatusLabel } from "./currency"
+import { formatINR, formatUSDT, conversionStatusLabel } from "./currency"
 
 describe("formatINR", () => {
   it("formats a basic amount with Indian grouping", () => {
@@ -50,6 +50,40 @@ describe("formatINR", () => {
     const out = formatINR(78908.9)
     expect(out).not.toMatch(/\$/)
     expect(out).not.toMatch(/USD/)
+  })
+})
+
+describe("formatUSDT", () => {
+  it("formats a basic amount with western grouping and a USDT suffix", () => {
+    expect(formatUSDT(79700)).toBe("79,700.00 USDT")
+  })
+
+  it("formats large amounts with comma grouping", () => {
+    expect(formatUSDT(1234567.8)).toBe("1,234,567.80 USDT")
+  })
+
+  it("returns N/A for null", () => {
+    expect(formatUSDT(null)).toBe("N/A")
+  })
+
+  it("returns N/A for undefined", () => {
+    expect(formatUSDT(undefined)).toBe("N/A")
+  })
+
+  it("returns N/A for NaN", () => {
+    expect(formatUSDT(NaN)).toBe("N/A")
+  })
+
+  it("prefixes a minus sign for negative values", () => {
+    expect(formatUSDT(-125)).toBe("-125.00 USDT")
+  })
+
+  it("prefixes a plus sign for positive values when showSign is set", () => {
+    expect(formatUSDT(250.5, { showSign: true })).toBe("+250.50 USDT")
+  })
+
+  it("never renders a rupee sign", () => {
+    expect(formatUSDT(78908.9)).not.toMatch(/₹/)
   })
 })
 

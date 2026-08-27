@@ -17,13 +17,12 @@ import structlog
 from database.schema import async_session
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
 from services.market_data.binance import BinanceExchange
-from services.market_data.live_state import market_ws
+from services.market_data.live_state import market_ws, live_candle_aggregator
 from services.scheduler.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from services.scheduler.jobs import (
     account_sync_job, exit_alert_job, signal_generation_job, outcome_evaluation_job, candle_ingestion_job,
     live_breakout_job,
 )
-from services.signal_engine.live_breakout import LiveCandleAggregator
 
 logger = structlog.get_logger()
 
@@ -48,12 +47,12 @@ class SchedulerRunner:
         self.outcome_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.candle_ingestion_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.live_breakout_breaker = CircuitBreaker(config=CircuitBreakerConfig())
-        # Persistent across ticks (unlike the per-tick-fresh CoinDCX/Binance
-        # clients above) -- it must remember the forming candle's running
-        # high/low between calls. Reuses the process-wide live market-data
-        # singleton (services/market_data/live_state.py) rather than
-        # opening a second connection.
-        self._live_candle_aggregator = LiveCandleAggregator(timeframe="4h")
+        # The SHARED, process-wide forming-candle aggregator (services/
+        # market_data/live_state.py) -- not a private instance -- so the
+        # Live Chart (apps/api/routers/market.py) and this scheduler's live
+        # signal detection always see the exact same forming-bar state,
+        # never two independently-drifting copies.
+        self._live_candle_aggregator = live_candle_aggregator
 
     def _make_provider(self) -> CoinDCXReadOnlyAccountProvider:
         return CoinDCXReadOnlyAccountProvider(self._api_key, self._api_secret)

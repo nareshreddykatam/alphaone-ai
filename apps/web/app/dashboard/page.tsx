@@ -89,6 +89,7 @@ export default function DashboardPage() {
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
           <MarketStatusCard
+            priceUsdt={data?.btc_price_usdt}
             priceInr={data?.btc_price_inr}
             markPriceUsdt={data?.market_data_mark_price_usdt}
             status={data?.market_data_status}
@@ -154,6 +155,9 @@ export default function DashboardPage() {
           signal={data?.current_signal}
           regime={data?.market_regime}
           quality={data?.signal_quality}
+          entryUsdt={data?.signal_entry_price}
+          slUsdt={data?.signal_stop_loss}
+          tp1Usdt={data?.signal_take_profit_1}
           entryInr={data?.signal_entry_price_inr}
           slInr={data?.signal_stop_loss_inr}
           tp1Inr={data?.signal_take_profit_1_inr}

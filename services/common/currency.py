@@ -1,8 +1,13 @@
-"""Single centralized INR formatter for backend-generated text (Telegram
-messages). The frontend has its own formatINR (apps/web/lib/currency.ts,
-via Intl.NumberFormat) -- this is the Python-side equivalent so Telegram
-output uses the same Indian digit-grouping convention (lakhs/crores)
-instead of scattering ad-hoc f-strings across services/telegram/bot.py.
+"""Centralized currency formatters for backend-generated text (Telegram
+messages). The frontend has its own formatINR/formatUSDT (apps/web/lib/
+currency.ts, via Intl.NumberFormat) -- these are the Python-side
+equivalents so Telegram output uses consistent formatting instead of
+scattering ad-hoc f-strings across services/telegram/bot.py.
+
+format_usdt exists because BTC/USDT Perpetual is the actual CoinDCX
+trading instrument -- USDT is the primary/authoritative trading
+denomination for signal levels (Entry/SL/TP), and INR (format_inr) is
+only the secondary converted representation. See docs/known_limitations.md.
 """
 from typing import Optional
 
@@ -35,3 +40,12 @@ def format_inr(value: Optional[float], show_sign: bool = False) -> str:
         rupees += 1
         paise = 0
     return f"{sign}₹{_group_indian(str(rupees))}.{paise:02d}"
+
+
+def format_usdt(value: Optional[float], show_sign: bool = False) -> str:
+    """Western-grouped USDT string, e.g. format_usdt(79700) == '79,700.00 USDT'.
+    Returns 'N/A' for None -- never fabricates a value."""
+    if value is None:
+        return "N/A"
+    sign = "-" if value < 0 else ("+" if (show_sign and value > 0) else "")
+    return f"{sign}{abs(value):,.2f} USDT"

@@ -1,14 +1,25 @@
-// Single centralized INR formatter -- AlphaOne is INR-only in the UI
-// (the user's CoinDCX futures account is INR-margined). Never scatter
-// `$${value}` or ad-hoc toLocaleString() currency formatting in components;
-// import formatINR from here instead.
+// Centralized currency formatters.
 //
-// Uses Intl.NumberFormat('en-IN') for correct Indian digit grouping
-// (lakhs/crores, e.g. ₹1,00,000.00) rather than reimplementing it.
+// formatINR: for genuinely INR-native amounts (the user's CoinDCX futures
+// account equity/margin/P&L, which is INR-margined) and as the SECONDARY
+// converted representation of a USDT trading price. Never scatter `$${value}`
+// or ad-hoc toLocaleString() currency formatting in components; import from
+// here instead. Uses Intl.NumberFormat('en-IN') for correct Indian digit
+// grouping (lakhs/crores, e.g. ₹1,00,000.00) rather than reimplementing it.
+//
+// formatUSDT: the actual CoinDCX BTC/USDT Perpetual trading instrument is
+// quoted in USDT -- USDT is the PRIMARY/authoritative denomination for the
+// live price and every signal level (Entry/SL/TP). Never replace a USDT
+// trading price with an INR-only value; INR is always secondary/additional.
 
 const inrFormatter = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+})
+
+const usdtFormatter = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 2,
   maximumFractionDigits: 2,
 })
@@ -22,6 +33,15 @@ export function formatINR(value: number | null | undefined, options: FormatINROp
   if (value === null || value === undefined || Number.isNaN(value)) return "N/A"
   const abs = Math.abs(value)
   const formatted = inrFormatter.format(abs)
+  if (value < 0) return `-${formatted}`
+  if (options.showSign && value > 0) return `+${formatted}`
+  return formatted
+}
+
+export function formatUSDT(value: number | null | undefined, options: FormatINROptions = {}): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "N/A"
+  const abs = Math.abs(value)
+  const formatted = `${usdtFormatter.format(abs)} USDT`
   if (value < 0) return `-${formatted}`
   if (options.showSign && value > 0) return `+${formatted}`
   return formatted
