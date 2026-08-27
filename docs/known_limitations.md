@@ -1,6 +1,51 @@
-# Known limitations (Phase 2 + Phase 2.5 + Phase 2.6 + Phase 3 + Phase 4 + Phase 5 + INR-only UI + Live Market Data)
+# Known limitations (Phase 2 + Phase 2.5 + Phase 2.6 + Phase 3 + Phase 4 + Phase 5 + INR-only UI + Live Market Data + Live Breakout Signals)
 
 Documented explicitly rather than left to be discovered later.
+
+## Live Breakout Signals (intrabar detection, still 4h Donchian+ADX)
+
+- **Real multi-timeframe research found no credible edge below 4h --
+  the strategy was deliberately NOT changed.** Walk-forward tested (9
+  out-of-sample folds each, real fees/slippage/spread via the existing
+  backtester) the existing `trend_following` baseline standalone at
+  15m/1h/4h, plus two multi-timeframe variants (15m and 1h breakout each
+  gated by a 4h ADX+trend filter). Result: a clean, monotonic degradation
+  as trade frequency increased -- 4h (18.6 trades/fold) had the best and
+  only roughly-breakeven profile (PF 1.02, 4/9 folds profitable), while
+  15m (99.9 trades/fold) was uniformly unprofitable across all 9 folds
+  (PF 0.69, 0/9 profitable). The 4h higher-timeframe filter measurably
+  helped both lower timeframes (e.g. 1h alone: PF 0.85 -> 1h+4h-filter:
+  PF 0.90) but never closed the gap to a real edge. Per the explicit
+  instruction to retain 4h rather than invent an unvalidated strategy,
+  `services/signal_engine/strategy.py`'s `BaselineStrategy` (Donchian 20 +
+  ADX 25, 4h) was not touched at all by this phase -- "more frequent"
+  signals come from detecting the SAME breakout intrabar (see below), not
+  from a faster, unvalidated strategy.
+- **Cross-venue splice, disclosed rather than hidden.** The historical
+  closed candles the live evaluation reads are Binance-sourced
+  (`services/market_data/binance.py`, unchanged); the live tick spliced
+  onto them to build the currently-forming candle
+  (`services/signal_engine/live_breakout.py: LiveCandleAggregator`) comes
+  from CoinDCX's public B-BTC_USDT WebSocket
+  (`services/market_data/live_state.py`'s `market_ws`, reused rather than
+  building a second live feed). Both are liquid BTC/USDT perpetual markets
+  that track closely, but this is a real simplification: a small,
+  transient Binance/CoinDCX price basis could in principle cause the
+  live-detected breakout level to differ very slightly from what the
+  closed-candle (Binance-only) evaluation would compute once the candle
+  actually closes -- which is exactly why the live path is a genuinely
+  separate, additional detection (not a replacement for the closed-candle
+  `signal_generation_job`), and why both share the same DB-backed
+  per-candle dedup rather than trusting only one source.
+- **`market_regime` field, Phase 2.6 research construct, unchanged.** The
+  live path calls the same `MarketRegimeDetector` the closed-candle path
+  already uses -- no new regime logic was added.
+- **No frontend change was made.** The `Signal` schema is unchanged (no
+  new columns), so the existing Signals page already renders
+  live-detected signals correctly through the exact same INR-conversion
+  and table-rendering code path; a live-detected signal's `reasoning`
+  text is simply annotated with `[LIVE/INTRABAR: ...]`, visible in the
+  existing Reasoning column without any UI code change.
 
 ## Live Market Data (CoinDCX public WebSocket)
 

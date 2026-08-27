@@ -16,6 +16,7 @@ from services.exchange.suncrypto import SunCryptoMarketDataProvider, SunCryptoRe
 from services.exchange.coindcx import CoinDCXMarketDataProvider, CoinDCXReadOnlyAccountProvider
 from services.market_data.coindcx_ws import CoinDCXMarketDataWebSocket
 from services.market_data.live_state import _StartupRetrySupervisor
+from services.signal_engine.live_breakout import LiveCandleAggregator
 
 FORBIDDEN_SUBSTRINGS = (
     "place_order", "create_order", "submit_order", "send_order",
@@ -46,6 +47,7 @@ EXCHANGE_CLASSES = [
     CoinDCXReadOnlyAccountProvider,
     CoinDCXMarketDataWebSocket,
     _StartupRetrySupervisor,
+    LiveCandleAggregator,
 ]
 
 
@@ -135,3 +137,33 @@ def test_startup_retry_supervisor_takes_no_credentials_and_only_wraps_connect():
     assert "api_secret" not in signature.parameters
     method_names = _all_public_method_names(_StartupRetrySupervisor)
     assert set(method_names) <= {"is_running", "start", "stop"}
+
+
+def test_live_candle_aggregator_takes_no_credentials_and_has_no_exchange_calls():
+    """The live/intrabar breakout aggregator (services/signal_engine/
+    live_breakout.py) is pure in-memory OHLC bucketing -- it never talks
+    to CoinDCX or any exchange at all, takes no credentials, and exposes
+    only on_tick (plus the dataclass-like `current` attribute)."""
+    signature = inspect.signature(LiveCandleAggregator.__init__)
+    assert "api_key" not in signature.parameters
+    assert "api_secret" not in signature.parameters
+    method_names = _all_public_method_names(LiveCandleAggregator)
+    assert set(method_names) == {"on_tick"}
+
+
+def test_live_breakout_job_and_evaluator_are_read_only_by_name():
+    """services/signal_engine/live_breakout.py's module-level functions
+    must also pass the same forbidden-substring scan as every exchange
+    class above -- they orchestrate reads (candles, live price) and a DB
+    write of a Signal row, never an exchange call of any kind."""
+    import services.signal_engine.live_breakout as live_breakout_module
+
+    function_names = [
+        name for name, obj in inspect.getmembers(live_breakout_module, predicate=inspect.isfunction)
+        if not name.startswith("_")
+    ]
+    assert "evaluate_live_breakout" in function_names
+    for name in function_names:
+        lowered = name.lower()
+        for forbidden in FORBIDDEN_SUBSTRINGS:
+            assert forbidden not in lowered, f"live_breakout.{name} looks like an order-mutating function"

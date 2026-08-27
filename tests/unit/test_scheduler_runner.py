@@ -87,7 +87,7 @@ async def test_outcome_evaluation_tick_handles_no_data_gracefully(patched_sessio
 async def test_start_and_stop_lifecycle_creates_and_cancels_all_jobs(patched_session):
     runner = SchedulerRunner()
     runner.start()
-    assert len(runner._tasks) == 5
+    assert len(runner._tasks) == 6
     assert all(not t.done() for t in runner._tasks)
 
     await runner.stop()
@@ -181,3 +181,81 @@ async def test_candle_ingestion_failure_does_not_affect_other_breakers(patched_s
 
     await runner.run_once_signal_generation()
     assert runner.signal_breaker.state == CircuitState.CLOSED
+
+
+# ---- 6th job: live_breakout ----
+
+@pytest.mark.asyncio
+async def test_live_breakout_tick_records_success(patched_session, monkeypatch):
+    async def _fake_job(session, market_ws, aggregator, **kwargs):
+        return None  # no breakout this tick -- still a success, not a failure
+
+    monkeypatch.setattr("services.scheduler.runner.live_breakout_job", _fake_job)
+    runner = SchedulerRunner()
+    await runner.run_once_live_breakout()
+    assert runner.live_breakout_breaker.state == CircuitState.CLOSED
+    assert runner.live_breakout_breaker.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_live_breakout_tick_records_failure_on_exception(patched_session, monkeypatch):
+    async def _boom(session, market_ws, aggregator, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("services.scheduler.runner.live_breakout_job", _boom)
+    runner = SchedulerRunner()
+    for _ in range(runner.live_breakout_breaker.config.failure_threshold):
+        await runner.run_once_live_breakout()
+    assert runner.live_breakout_breaker.state.value == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_live_breakout_tick_skips_when_circuit_open(patched_session, monkeypatch):
+    calls = {"n": 0}
+
+    async def _boom(session, market_ws, aggregator, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("services.scheduler.runner.live_breakout_job", _boom)
+    runner = SchedulerRunner()
+    for _ in range(runner.live_breakout_breaker.config.failure_threshold):
+        await runner.run_once_live_breakout()
+    calls_after_open = calls["n"]
+
+    await runner.run_once_live_breakout()  # circuit should now be open -- job must not be called
+    assert calls["n"] == calls_after_open
+
+
+@pytest.mark.asyncio
+async def test_live_breakout_failure_does_not_affect_other_breakers(patched_session, monkeypatch):
+    async def _boom(session, market_ws, aggregator, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("services.scheduler.runner.live_breakout_job", _boom)
+    runner = SchedulerRunner()
+    for _ in range(runner.live_breakout_breaker.config.failure_threshold):
+        await runner.run_once_live_breakout()
+    assert runner.live_breakout_breaker.state.value == "OPEN"
+
+    await runner.run_once_candle_ingestion()
+    assert runner.candle_ingestion_breaker.state == CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_live_breakout_uses_a_persistent_aggregator_shared_across_ticks(patched_session, monkeypatch):
+    """The forming-candle aggregator must be the SAME object across ticks
+    (unlike the per-tick-fresh CoinDCX/Binance clients) -- otherwise it
+    could never remember a running high/low within one still-forming bar."""
+    seen_aggregators = []
+
+    async def _fake_job(session, market_ws, aggregator, **kwargs):
+        seen_aggregators.append(aggregator)
+        return None
+
+    monkeypatch.setattr("services.scheduler.runner.live_breakout_job", _fake_job)
+    runner = SchedulerRunner()
+    await runner.run_once_live_breakout()
+    await runner.run_once_live_breakout()
+    assert seen_aggregators[0] is seen_aggregators[1]
+    assert seen_aggregators[0] is runner._live_candle_aggregator

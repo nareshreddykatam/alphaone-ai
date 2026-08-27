@@ -17,6 +17,12 @@ default to conservative values rather than guessing an aggressive one):
   latest candle is already stored, and bounds how stale that candle can
   ever get to at most 15 minutes for /generate, the chart, and
   signal_generation_job's own same-cadence reads)
+- live_breakout_job: every 30s (same cadence as account_sync/exit_alert --
+  detects the SAME validated 4h Donchian+ADX breakout intrabar, via the
+  existing live CoinDCX price feed, instead of waiting up to 15 minutes
+  for signal_generation_job's next tick after the candle actually closes;
+  see services/signal_engine/live_breakout.py for why this does not
+  change the strategy itself)
 """
 from datetime import datetime, timedelta
 from typing import Optional
@@ -24,15 +30,18 @@ from typing import Optional
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.schema.models import Candle
+from database.schema.models import Candle, Signal
 from sqlalchemy import select
 
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
 from services.exchange.coindcx_sync import sync_balance, sync_positions, sync_trade_fills
 from services.market_data.binance import BinanceExchange
+from services.market_data.coindcx_ws import CoinDCXMarketDataWebSocket
 from services.market_data.ingestion import DataIngestionService
 from services.position_monitor.monitor import get_new_exit_alerts
+from services.signal_engine.live_breakout import LiveCandleAggregator, evaluate_live_breakout
 from services.signal_engine.live_signal import generate_and_persist_signal
+from services.signal_engine.notify import notify_new_signal
 from services.signal_engine.outcome_evaluator import evaluate_pending_signal_outcomes
 
 logger = structlog.get_logger()
@@ -100,3 +109,21 @@ async def candle_ingestion_job(
     end = datetime.utcnow()
     start = end - timedelta(hours=lookback_hours)
     return await svc.backfill(symbol, timeframe, start, end)
+
+
+async def live_breakout_job(
+    session: AsyncSession,
+    market_ws: CoinDCXMarketDataWebSocket,
+    aggregator: LiveCandleAggregator,
+    symbol: str = "BTC/USDT",
+    timeframe: str = "4h",
+) -> Optional[Signal]:
+    """Evaluates the unmodified 4h Donchian+ADX strategy intrabar (see
+    services/signal_engine/live_breakout.py) and, only for a genuinely new
+    breakout, notifies exactly like the closed-candle path does
+    (notify_new_signal -- same Telegram template, same NotificationLog
+    dedup, same INR conversion)."""
+    signal = await evaluate_live_breakout(session, market_ws, aggregator, symbol=symbol, timeframe=timeframe)
+    if signal is not None:
+        await notify_new_signal(session, signal)
+    return signal

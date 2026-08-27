@@ -17,10 +17,13 @@ import structlog
 from database.schema import async_session
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
 from services.market_data.binance import BinanceExchange
+from services.market_data.live_state import market_ws
 from services.scheduler.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from services.scheduler.jobs import (
     account_sync_job, exit_alert_job, signal_generation_job, outcome_evaluation_job, candle_ingestion_job,
+    live_breakout_job,
 )
+from services.signal_engine.live_breakout import LiveCandleAggregator
 
 logger = structlog.get_logger()
 
@@ -29,6 +32,7 @@ EXIT_ALERT_INTERVAL_SECONDS = 30
 SIGNAL_GENERATION_INTERVAL_SECONDS = 900  # 15 min -- primary strategy is 4h, no value in checking more often
 OUTCOME_EVALUATION_INTERVAL_SECONDS = 900
 CANDLE_INGESTION_INTERVAL_SECONDS = 900  # 15 min -- see services/scheduler/jobs.py's module docstring for the reasoning
+LIVE_BREAKOUT_INTERVAL_SECONDS = 30  # same cadence as account_sync/exit_alert -- see jobs.py's module docstring
 
 
 class SchedulerRunner:
@@ -43,6 +47,13 @@ class SchedulerRunner:
         self.signal_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.outcome_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.candle_ingestion_breaker = CircuitBreaker(config=CircuitBreakerConfig())
+        self.live_breakout_breaker = CircuitBreaker(config=CircuitBreakerConfig())
+        # Persistent across ticks (unlike the per-tick-fresh CoinDCX/Binance
+        # clients above) -- it must remember the forming candle's running
+        # high/low between calls. Reuses the process-wide live market-data
+        # singleton (services/market_data/live_state.py) rather than
+        # opening a second connection.
+        self._live_candle_aggregator = LiveCandleAggregator(timeframe="4h")
 
     def _make_provider(self) -> CoinDCXReadOnlyAccountProvider:
         return CoinDCXReadOnlyAccountProvider(self._api_key, self._api_secret)
@@ -124,6 +135,20 @@ class SchedulerRunner:
         finally:
             await exchange.close()
 
+    async def run_once_live_breakout(self) -> None:
+        if not self.live_breakout_breaker.can_attempt():
+            logger.warning("live_breakout_job skipped -- circuit open")
+            return
+        try:
+            async with async_session() as session:
+                signal = await live_breakout_job(session, market_ws, self._live_candle_aggregator)
+            self.live_breakout_breaker.record_success()
+            if signal is not None:
+                logger.info("live_breakout_job detected a new breakout", signal_id=signal.signal_id, signal_type=signal.signal_type)
+        except Exception as e:
+            self.live_breakout_breaker.record_failure()
+            logger.error("live_breakout_job failed", error=str(e))
+
     async def _loop(self, tick_fn, interval_seconds: float) -> None:
         while self._running:
             await tick_fn()
@@ -139,6 +164,7 @@ class SchedulerRunner:
             asyncio.create_task(self._loop(self.run_once_signal_generation, SIGNAL_GENERATION_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop(self.run_once_outcome_evaluation, OUTCOME_EVALUATION_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop(self.run_once_candle_ingestion, CANDLE_INGESTION_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop(self.run_once_live_breakout, LIVE_BREAKOUT_INTERVAL_SECONDS)),
         ]
         logger.info("Scheduler started", jobs=len(self._tasks))
 

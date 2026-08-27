@@ -145,14 +145,28 @@ def test_market_ws_module_is_not_imported_by_position_or_exit_monitoring():
     poll, Phase 5) is a separate, already-correct data path -- this
     phase's public B-BTC_USDT WebSocket must never be wired into position
     PnL or exit-alert math, which would silently apply the wrong
-    instrument's price to a real INR-margined position."""
+    instrument's price to a real INR-margined position.
+
+    services/position_monitor/monitor.py never references the live
+    market-data module at all -- checked at the whole-module level, same
+    as before. services/scheduler/jobs.py now legitimately imports
+    CoinDCXMarketDataWebSocket for a DIFFERENT, intentional purpose (live/
+    intrabar SIGNAL detection -- services/signal_engine/live_breakout.py,
+    added in the Live Breakout Signals phase), so the check there is
+    scoped to the specific functions that must never touch it: exit_alert_job
+    and account_sync_job (position/balance sync) -- not the whole file."""
     import inspect
     import services.position_monitor.monitor as monitor_module
-    import services.scheduler.jobs as jobs_module
+    from services.scheduler.jobs import exit_alert_job, account_sync_job, _latest_price
 
-    for module in (monitor_module, jobs_module):
-        source = inspect.getsource(module)
-        assert "coindcx_ws" not in source, f"{module.__name__} must not import the live market-data WebSocket"
+    monitor_source = inspect.getsource(monitor_module)
+    assert "coindcx_ws" not in monitor_source, "position_monitor.monitor must not import the live market-data WebSocket"
+
+    for fn in (exit_alert_job, account_sync_job, _latest_price):
+        fn_source = inspect.getsource(fn)
+        assert "market_ws" not in fn_source and "CoinDCXMarketDataWebSocket" not in fn_source, (
+            f"{fn.__name__} must not use the public live market-data WebSocket for position/exit math"
+        )
 
 
 # ---- Startup retry (production hardening) integration coverage ----
