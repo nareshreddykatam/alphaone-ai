@@ -471,6 +471,104 @@ def mtf_trend_signal_func(breakout_period: int = 20, adx_threshold: float = 20):
 
 
 # ---------------------------------------------------------------------------
+# S11 -- Z-Score Mean Reversion (15m)
+#
+# Hypothesis: price deviating an unusual number of standard deviations from
+# its own recent rolling mean (a pure statistical extreme, no session
+# anchoring) tends to revert once the deviation itself starts shrinking.
+# Deliberately distinct from S03 (VWAP Mean Reversion): S03 measures
+# distance from a volume-weighted, UTC-day-anchored price; this measures
+# distance from a plain rolling price mean, in standard-deviation units,
+# with no session dependency and no volume weighting at all -- a genuinely
+# different statistical construction of "how far is price from normal."
+# ---------------------------------------------------------------------------
+
+def precompute_zscore_reversion(df: pd.DataFrame, period: int = 50) -> pd.DataFrame:
+    df = df.copy()
+    roll_mean = df["close"].rolling(period).mean()
+    roll_std = df["close"].rolling(period).std()
+    df["_zscore"] = (df["close"] - roll_mean) / roll_std.replace(0, np.nan)
+    df["_atr_14"] = atr(df["high"], df["low"], df["close"], 14)
+    return df
+
+
+def zscore_reversion_signal_func(z_entry: float = 2.0):
+    def _signal(df: pd.DataFrame) -> dict | None:
+        if len(df) < 55:
+            return None
+        last, prev = df.iloc[-1], df.iloc[-2]
+        if pd.isna(last["_zscore"]) or pd.isna(prev["_zscore"]) or pd.isna(last["_atr_14"]) or last["_atr_14"] <= 0:
+            return None
+
+        entry = last["close"]
+        # Extreme oversold AND the deviation is already shrinking (z moving
+        # back toward zero) -- never enters while still extending further.
+        if prev["_zscore"] < -z_entry and last["_zscore"] > prev["_zscore"]:
+            return {"signal_type": "LONG", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "LONG", sl_mult=1.5, tp_mults=(1.0, 2.0, 3.0))}
+        if prev["_zscore"] > z_entry and last["_zscore"] < prev["_zscore"]:
+            return {"signal_type": "SHORT", "leverage": 1, **_atr_sl_tp(entry, last["_atr_14"], "SHORT", sl_mult=1.5, tp_mults=(1.0, 2.0, 3.0))}
+        return None
+
+    return _signal
+
+
+# ---------------------------------------------------------------------------
+# S12 -- Structure Breakout + Retest (4h)
+#
+# Hypothesis: a level that price has already broken through and is now
+# retesting from the far side (without invalidating it) is a lower-risk
+# continuation entry than the moment of the original breakout -- distinct
+# from S05 (enters AT the Donchian breakout itself) and S06 (a trailing
+# ATR-band flip, no notion of a specific broken level being retested).
+# ---------------------------------------------------------------------------
+
+def precompute_structure_retest(df: pd.DataFrame, swing_period: int = 20) -> pd.DataFrame:
+    df = df.copy()
+    df["_swing_high"] = df["high"].rolling(swing_period).max()
+    df["_swing_low"] = df["low"].rolling(swing_period).min()
+    df["_atr_14"] = atr(df["high"], df["low"], df["close"], 14)
+    return df
+
+
+def structure_retest_signal_func(lookback_break: int = 8, retest_atr_mult: float = 0.75):
+    def _signal(df: pd.DataFrame) -> dict | None:
+        if len(df) < lookback_break + 30:
+            return None
+        last = df.iloc[-1]
+        if pd.isna(last["_atr_14"]) or last["_atr_14"] <= 0:
+            return None
+
+        # The resistance/support level being tested is the swing extreme
+        # from BEFORE the breakout window -- never the swing value computed
+        # using bars inside the window itself (that would just describe the
+        # breakout bar's own high/low, not a real prior level).
+        level_idx = -(lookback_break + 2)
+        if len(df) < abs(level_idx) + 1:
+            return None
+        prior_swing_high = df["_swing_high"].iloc[level_idx]
+        prior_swing_low = df["_swing_low"].iloc[level_idx]
+        if pd.isna(prior_swing_high) or pd.isna(prior_swing_low):
+            return None
+
+        window = df.iloc[-(lookback_break + 1):-1]
+        entry = last["close"]
+        atr_val = last["_atr_14"]
+
+        broke_up = (window["close"] > prior_swing_high).any()
+        retesting_from_above = 0 <= (entry - prior_swing_high) <= retest_atr_mult * atr_val
+        if broke_up and retesting_from_above:
+            return {"signal_type": "LONG", "leverage": 1, **_atr_sl_tp(entry, atr_val, "LONG")}
+
+        broke_down = (window["close"] < prior_swing_low).any()
+        retesting_from_below = 0 <= (prior_swing_low - entry) <= retest_atr_mult * atr_val
+        if broke_down and retesting_from_below:
+            return {"signal_type": "SHORT", "leverage": 1, **_atr_sl_tp(entry, atr_val, "SHORT")}
+        return None
+
+    return _signal
+
+
+# ---------------------------------------------------------------------------
 # Registry -- mirrors ml/evaluation/baselines.py's BASELINE_STRATEGIES shape.
 # S05 (existing Donchian+ADX) is deliberately NOT here: it is never
 # re-implemented, only ever reused via services.signal_engine.strategy.
@@ -539,6 +637,20 @@ MULTI_STRATEGIES: dict[str, dict] = {
         "timeframe": "4h",
         "precompute": None,  # needs both df_4h and df_1d -- see precompute_mtf_trend
         "factory": lambda: mtf_trend_signal_func(20, 20),
+        "data_mode": "CLOSED_CANDLE",
+    },
+    "S11_ZSCORE_REVERSION_15M": {
+        "display_name": "Z-Score Mean Reversion",
+        "timeframe": "15m",
+        "precompute": precompute_zscore_reversion,
+        "factory": lambda: zscore_reversion_signal_func(2.0),
+        "data_mode": "CLOSED_CANDLE",
+    },
+    "S12_STRUCTURE_RETEST_4H": {
+        "display_name": "Structure Breakout + Retest",
+        "timeframe": "4h",
+        "precompute": precompute_structure_retest,
+        "factory": lambda: structure_retest_signal_func(8, 0.75),
         "data_mode": "CLOSED_CANDLE",
     },
 }

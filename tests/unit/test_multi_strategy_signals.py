@@ -77,7 +77,7 @@ def _signal_types_seen(df: pd.DataFrame, precompute_fn, signal_func, step: int) 
 # ---- 1/2/3. Every strategy can return LONG, SHORT (where directionally
 # symmetric), and NO_TRADE. ----
 
-@pytest.mark.parametrize("strategy_id", ["S01_MOMENTUM_BREAKOUT_15M", "S02_EMA_PULLBACK_15M", "S03_VWAP_REVERSION_15M", "S04_RSI_BB_15M"])
+@pytest.mark.parametrize("strategy_id", ["S01_MOMENTUM_BREAKOUT_15M", "S02_EMA_PULLBACK_15M", "S03_VWAP_REVERSION_15M", "S04_RSI_BB_15M", "S11_ZSCORE_REVERSION_15M"])
 def test_15m_strategy_produces_both_directions(strategy_id, synthetic_15m):
     spec = MULTI_STRATEGIES[strategy_id]
     seen = _signal_types_seen(synthetic_15m, spec["precompute"], spec["factory"](), step=3)
@@ -85,7 +85,7 @@ def test_15m_strategy_produces_both_directions(strategy_id, synthetic_15m):
     assert "SHORT" in seen, f"{strategy_id} never fired SHORT"
 
 
-@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H"])
+@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H", "S12_STRUCTURE_RETEST_4H"])
 def test_4h_strategy_produces_both_directions(strategy_id, synthetic_4h):
     spec = MULTI_STRATEGIES[strategy_id]
     seen = _signal_types_seen(synthetic_4h, spec["precompute"], spec["factory"](), step=1)
@@ -138,7 +138,7 @@ def _assert_valid_levels(signal_type: str, entry: float, sl, tp1, tp2, tp3):
             assert tp < entry, "SHORT take-profit must be below entry"
 
 
-@pytest.mark.parametrize("strategy_id", ["S01_MOMENTUM_BREAKOUT_15M", "S02_EMA_PULLBACK_15M", "S03_VWAP_REVERSION_15M", "S04_RSI_BB_15M"])
+@pytest.mark.parametrize("strategy_id", ["S01_MOMENTUM_BREAKOUT_15M", "S02_EMA_PULLBACK_15M", "S03_VWAP_REVERSION_15M", "S04_RSI_BB_15M", "S11_ZSCORE_REVERSION_15M"])
 def test_15m_strategy_entry_sl_tp_are_valid(strategy_id, synthetic_15m):
     spec = MULTI_STRATEGIES[strategy_id]
     prepared = spec["precompute"](synthetic_15m)
@@ -154,7 +154,7 @@ def test_15m_strategy_entry_sl_tp_are_valid(strategy_id, synthetic_15m):
     assert checked > 0, f"{strategy_id} never produced a signal to validate levels against"
 
 
-@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H"])
+@pytest.mark.parametrize("strategy_id", ["S06_SUPERTREND_ATR_4H", "S07_MACD_MOMENTUM_4H", "S08_EMA_ADX_4H", "S09_ATR_BREAKOUT_4H", "S12_STRUCTURE_RETEST_4H"])
 def test_4h_strategy_entry_sl_tp_are_valid(strategy_id, synthetic_4h):
     spec = MULTI_STRATEGIES[strategy_id]
     prepared = spec["precompute"](synthetic_4h)

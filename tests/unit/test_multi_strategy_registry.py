@@ -30,21 +30,46 @@ def _make_ohlcv(n: int, seed: int, freq_minutes: int) -> pd.DataFrame:
 
 
 # ---- Registry structure ----
+#
+# The registry holds 12 entries: the original 10 (S01-S10) plus 2
+# replacement candidates (S11, S12) investigated during the v2 rigorous
+# research pass and REJECTED -- kept in the registry (fully implemented,
+# tested, excluded from live evaluation) as a transparent record rather
+# than silently deleted. Only S05 and S06 are PRODUCTION_ELIGIBLE; see
+# services/signal_engine/multi_strategy.py's module docstring and
+# reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt for why.
 
-def test_registry_has_exactly_ten_strategies():
-    assert len(MULTI_STRATEGY_REGISTRY) == 10
+def test_registry_has_exactly_twelve_strategies():
+    assert len(MULTI_STRATEGY_REGISTRY) == 12
     ids = [d.strategy_id for d in MULTI_STRATEGY_REGISTRY]
     assert len(ids) == len(set(ids)), "strategy_id must be unique"
 
 
 def test_timeframe_distribution_matches_spec():
-    """4 strategies at 15m, 6 at 4h (S05 existing + 5 new), per the
-    explicit task structure."""
+    """5 candidates at 15m (4 original + 1 rejected replacement), 7 at 4h
+    (6 original + 1 rejected replacement)."""
     by_tf = {}
     for d in MULTI_STRATEGY_REGISTRY:
         by_tf.setdefault(d.timeframe, []).append(d.strategy_id)
-    assert len(by_tf["15m"]) == 4
-    assert len(by_tf["4h"]) == 6
+    assert len(by_tf["15m"]) == 5
+    assert len(by_tf["4h"]) == 7
+
+
+def test_only_s05_and_s06_are_production_eligible():
+    """Under the stricter v2 methodology, only S06 (of the new/replacement
+    candidates) cleared the production bar; S05 keeps its status by
+    explicit protection, not because the stricter test independently
+    re-validates it. Every other candidate -- including both REJECTED
+    replacements -- must never be PRODUCTION_ELIGIBLE."""
+    eligible = {d.strategy_id for d in MULTI_STRATEGY_REGISTRY if d.production_status == "PRODUCTION_ELIGIBLE"}
+    assert eligible == {"S05_DONCHIAN_ADX_4H", "S06_SUPERTREND_ATR_4H"}
+
+
+def test_rejected_candidates_are_excluded_from_live_evaluation():
+    rejected = [d for d in MULTI_STRATEGY_REGISTRY if d.production_status == "REJECTED"]
+    assert {d.strategy_id for d in rejected} == {"S11_ZSCORE_REVERSION_15M", "S12_STRUCTURE_RETEST_4H"}
+    for d in rejected:
+        assert d.production_status != "PRODUCTION_ELIGIBLE"
 
 
 def test_s05_is_the_untouched_existing_baseline():
@@ -80,7 +105,10 @@ def test_every_strategy_has_a_non_empty_disclaimer_in_its_reasoning():
             result = strategy.generate(df)
         assert result.signal_type == "NO_TRADE"
         assert len(result.reasoning) > 20
-        assert "RESEARCH_ONLY" in result.reasoning or "PRODUCTION" in result.reasoning or d.strategy_id == "S06_SUPERTREND_ATR_4H"
+        assert (
+            "RESEARCH_ONLY" in result.reasoning or "PRODUCTION" in result.reasoning
+            or "REJECTED" in result.reasoning or d.strategy_id == "S06_SUPERTREND_ATR_4H"
+        )
 
 
 def test_get_strategy_definition_raises_for_unknown_id():

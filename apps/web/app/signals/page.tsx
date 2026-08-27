@@ -116,7 +116,9 @@ export default function SignalsPage() {
               <option value={ALL}>All strategies</option>
               {strategies.map((s) => (
                 <option key={s.strategy_id} value={s.strategy_id}>
-                  {s.strategy_id} -- {s.display_name} ({s.production_status === "PRODUCTION_ELIGIBLE" ? "live" : "research"})
+                  {s.strategy_id} -- {s.display_name} ({
+                    s.production_status === "PRODUCTION_ELIGIBLE" ? "live" : s.production_status === "REJECTED" ? "rejected" : "research"
+                  })
                 </option>
               ))}
             </select>

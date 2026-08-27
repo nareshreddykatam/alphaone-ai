@@ -477,3 +477,36 @@ Documented explicitly rather than left to be discovered later.
   real data is out of scope for this phase.
 - No standing/production ingestion scheduler -- `scripts/download_data.py`
   is run manually or via an external scheduler of the operator's choosing.
+
+## Multi-strategy research (v2, rigorous pass) -- fresh S05 finding
+
+A stricter re-research of the whole strategy registry (chronological
+train/validation/OOS split, parameters frozen on VALIDATION before ever
+touching OOS -- see `scripts/research_v2_rigorous.py` and
+`reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt` for full, real,
+unedited output) re-examined the EXISTING, protected S05 (Donchian+ADX)
+baseline for a fair comparison against every new candidate. On the
+~7-month out-of-sample window this pass used, S05 did not clear a
+"robust OOS edge" bar either: profit factor 0.82, only 1 of 4 OOS
+walk-forward folds profitable, and a max drawdown near the unlucky end
+of its own trade-order bootstrap distribution.
+
+This is **not** a new problem discovered in S05 -- it is consistent with,
+and reinforces, the disclaimer every S05 signal has always carried
+("never confirmed as a robust, cost-surviving edge... treat as a
+research heuristic, not a guaranteed outcome," `services/signal_engine/
+strategy.py`). S05's implementation and production status were
+**deliberately not changed** by this finding, per the explicit
+instruction protecting it from being silently replaced or retuned
+because a stricter test (or another candidate) looked different. Anyone
+considering a future change to S05 should read the full section in
+`reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt` first.
+
+Of the 9 new/replacement candidates examined in that same pass, only
+S06 (Supertrend + ATR, 4h) cleared the project's evidence bar --
+modestly, not decisively (OOS PF 1.10, 2 of 4 walk-forward folds
+profitable, low absolute drawdown, LONG-side-carries-the-result
+asymmetry disclosed). All five 15m candidates tested (including one new
+replacement, Z-Score Mean Reversion) failed decisively -- zero out of
+four OOS walk-forward folds profitable, across every one of them. As of
+this pass, AlphaOne has no defensible 15m production strategy.

@@ -1,24 +1,42 @@
-"""The 10-strategy independent signal registry.
+"""The strategy signal registry.
 
 S05 (existing validated Donchian+ADX) is untouched -- reused directly via
-services.signal_engine.strategy.BaselineStrategy, never re-implemented.
+services.signal_engine.strategy.BaselineStrategy, never re-implemented, per
+explicit instruction to protect it: its production status is not changed
+by this file's research, even where the newer, stricter methodology below
+found it does not clear the same bar as a fresh candidate would need to.
 
-S01-S04 (15m) and S06-S10 (4h) are the 9 new candidates researched in
-scripts/research_multi_strategy.py against 3 years of real BTC/USDT
-historical data (see reports/MULTI_STRATEGY_RESEARCH_RESULTS.txt for the
-full, real, unedited backtest + walk-forward output this classification is
-based on). Each strategy's `production_status` reflects that evidence, not
-a hand-wave -- a strategy is PRODUCTION_ELIGIBLE only if BOTH its
-full-period backtest AND a majority of its walk-forward folds were
-profitable, and it did not show the classic overfitting signature of wild
-fold-to-fold instability. A strategy is not eligible merely because one
-number looked good.
+Classification methodology (v2, stricter than the original pass -- see
+reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt for the full, real, unedited
+output, and scripts/research_v2_rigorous.py for the exact code): every
+candidate is evaluated on a chronological, non-shuffled 60/20/20 TRAIN /
+VALIDATION / OUT-OF-SAMPLE split of ~3 years of real BTC/USDT candles. Any
+free parameter is grid-searched on TRAIN and selected using VALIDATION
+performance only (minimum 15 trades to be eligible, maximize profit
+factor); the winning parameters are then FROZEN and evaluated exactly once
+against the untouched OOS region -- never re-tuned after looking at OOS.
+Walk-forward folds, long/short breakdown, regime attribution, a trade-order
+bootstrap, and parameter-neighbor sensitivity are all computed on that same
+OOS region. `production_status` reflects this evidence: PRODUCTION_ELIGIBLE
+requires a positive OOS profit factor, a low absolute drawdown, at least
+half of the OOS walk-forward folds profitable, and no sign of the
+parameter-sensitivity or small-sample-outlier instability that marks
+overfitting. Under this stricter test, only S06 (of the 11 new/existing
+candidates re-examined) clears that bar; S05 is exempted from the bar by
+explicit instruction, not because this test independently re-validates it
+-- see its own finding in the report. Every other candidate, including two
+new ones (S11, S12) added specifically to look for a replacement before
+accepting "no 15m strategy passes," failed decisively (0/4 OOS
+walk-forward folds profitable, all 5 fifteen-minute candidates tested).
 
-Only PRODUCTION_ELIGIBLE strategies are ever evaluated by the live
-scheduler (services/signal_engine/multi_strategy_engine.py) -- RESEARCH_ONLY
-strategies exist here for testability/completeness and for the frontend's
-signal-history filters, but never generate a live signal, never persist a
-Signal row, and never reach Telegram.
+Statuses: PRODUCTION_ELIGIBLE, RESEARCH_ONLY, or REJECTED (a candidate that
+was specifically investigated as a replacement and found unsuitable -- kept
+in the registry, fully implemented and tested, purely for a transparent
+record; never evaluated live). Only PRODUCTION_ELIGIBLE strategies are ever
+evaluated by the live scheduler (services/signal_engine/multi_strategy_engine.py)
+-- both RESEARCH_ONLY and REJECTED strategies exist here for testability/
+completeness and the frontend's signal-history filters, but never generate
+a live signal, never persist a Signal row, and never reach Telegram.
 
 Every strategy independently returns LONG / SHORT / NO_TRADE. There is no
 consensus requirement and no cross-strategy suppression -- see
@@ -128,55 +146,80 @@ class MTFTrendStrategy(RuleBasedMultiStrategy):
 
 
 # ---------------------------------------------------------------------------
-# Disclaimers: each one states the REAL result from
-# reports/MULTI_STRATEGY_RESEARCH_RESULTS.txt (fee/slippage/funding-inclusive
-# backtest + 9-fold walk-forward against ~3 years of real BTC/USDT candles).
-# Never edit these without re-running scripts/research_multi_strategy.py and
-# updating both the report and this text together.
+# Disclaimers: each one states the REAL out-of-sample result from
+# reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt (chronological train/val/
+# OOS split, parameters frozen on VALIDATION before ever touching OOS, real
+# fees/slippage/funding). Never edit these without re-running
+# scripts/research_v2_rigorous.py and updating both the report and this
+# text together.
 # ---------------------------------------------------------------------------
 
 _DISCLAIMERS = {
     "S01_MOMENTUM_BREAKOUT_15M": (
-        "Research result: full-period losing (PF 0.57, -9.3%), 0/9 walk-forward "
-        "folds profitable against real 15m BTC/USDT data. RESEARCH_ONLY."
+        "OOS result (train/val/OOS split, frozen params): PF 0.63, return -9.1%, "
+        "0/4 OOS walk-forward folds profitable. LONG and SHORT both losing "
+        "(PF 0.40 / 0.76). Losing in every regime tested. RESEARCH_ONLY."
     ),
     "S02_EMA_PULLBACK_15M": (
-        "Research result: full-period losing (PF 0.30, -9.9%), 0/9 walk-forward "
-        "folds profitable. RESEARCH_ONLY."
+        "OOS result: PF 0.62, return -9.4%, 0/4 OOS walk-forward folds "
+        "profitable. LONG and SHORT both losing (PF 0.40 / 0.75). RESEARCH_ONLY."
     ),
     "S03_VWAP_REVERSION_15M": (
-        "Research result: full-period losing (PF 0.73, -8.1%), 0/9 walk-forward "
-        "folds profitable. RESEARCH_ONLY."
+        "OOS result: PF 0.67, return -8.8%, 0/4 OOS walk-forward folds "
+        "profitable. Sharply asymmetric: LONG near-breakeven (PF 1.02, 38 "
+        "trades) but SHORT loses heavily (PF 0.32, 30 trades) -- the losing "
+        "side dominates the combined result. RESEARCH_ONLY."
     ),
     "S04_RSI_BB_15M": (
-        "Research result: full-period losing (PF 0.59, -9.7%), 0/9 walk-forward "
-        "folds profitable. RESEARCH_ONLY."
+        "OOS result: PF 0.43, return -9.2%, 0/4 OOS walk-forward folds "
+        "profitable -- the weakest of the four 15m candidates tested. "
+        "RESEARCH_ONLY."
     ),
     "S06_SUPERTREND_ATR_4H": (
-        "Research result: full-period PF 1.25 (+4.2%), 6/9 walk-forward folds "
-        "profitable, max drawdown ~2% against real 4h BTC/USDT data -- the "
-        "strongest of the 9 new candidates tested. Still a research heuristic, "
-        "not a guaranteed or maximum-profit outcome."
+        "OOS result (train/val/OOS split, frozen params period=10, "
+        "multiplier=3.0): PF 1.10, return +0.4%, 2/4 OOS walk-forward folds "
+        "profitable, max drawdown ~1%. The strongest of the 12 candidates "
+        "re-examined under this stricter methodology, but the edge is modest, "
+        "not decisive: LONG carries the result (PF 1.52) while SHORT is weak "
+        "(PF 0.85), and only 2 of 4 OOS folds were profitable. Parameter "
+        "neighbors (period 7/14, multiplier 2.5/3.5) ranged PF 0.78-1.33 -- "
+        "reasonably stable, not collapsing, but not flat either. A trade-order "
+        "bootstrap (500x reshuffle) put the observed ~1% drawdown within the "
+        "expected range for this trade set. Still a research heuristic with a "
+        "real but modest OOS edge -- never a guaranteed or maximum-profit "
+        "outcome."
     ),
     "S07_MACD_MOMENTUM_4H": (
-        "Research result: full-period losing (PF 0.81, -6.2%) despite 5/9 "
-        "profitable walk-forward folds -- large losses in losing folds outweigh "
-        "gains. RESEARCH_ONLY."
+        "OOS result: PF 0.70, return -2.5%, 1/4 OOS walk-forward folds "
+        "profitable. RESEARCH_ONLY."
     ),
     "S08_EMA_ADX_4H": (
-        "Research result: full-period losing (PF 0.92, -5.3%), only 2/9 "
-        "walk-forward folds profitable. RESEARCH_ONLY."
+        "OOS result: PF 0.80, return -2.3%, 2/4 OOS walk-forward folds "
+        "profitable. RESEARCH_ONLY."
     ),
     "S09_ATR_BREAKOUT_4H": (
-        "Research result: full-period breakeven (PF 1.00), 4/9 walk-forward "
-        "folds profitable with high fold-to-fold variance (PF ranged 4.72 to "
-        "0.18 across folds) -- an overfitting/instability signature rather than "
-        "a robust edge. RESEARCH_ONLY."
+        "OOS result: PF 1.23, return +1.0%, 2/4 OOS walk-forward folds "
+        "profitable -- but on only 23 OOS trades, and one fold's PF (139, on "
+        "just 4 trades) is a small-sample outlier that inflates the headline "
+        "number rather than evidence of a real edge. RESEARCH_ONLY pending a "
+        "larger, less fold-dependent sample."
     ),
     "S10_MTF_TREND_4H": (
-        "Research result: full-period modestly positive (PF 1.06, +3.2%) but "
-        "only 4/9 walk-forward folds profitable with volatile fold-to-fold "
-        "swings. Not yet robust enough for production. RESEARCH_ONLY."
+        "OOS result: PF 0.75, return -2.8%, 2/4 OOS walk-forward folds "
+        "profitable. RESEARCH_ONLY."
+    ),
+    "S11_ZSCORE_REVERSION_15M": (
+        "Investigated as a 15m replacement candidate (statistical mean "
+        "reversion, distinct from S03's VWAP-anchored approach). OOS result: "
+        "PF 0.49, return -9.8%, 0/4 OOS walk-forward folds profitable -- "
+        "REJECTED, no replacement of any existing 15m slot."
+    ),
+    "S12_STRUCTURE_RETEST_4H": (
+        "Investigated as a 4h replacement candidate (breakout-then-retest "
+        "entry, distinct from S05's immediate-breakout and S06's trailing-"
+        "stop-flip mechanisms). OOS result: PF 0.53, return -6.7%, 0/4 OOS "
+        "walk-forward folds profitable -- REJECTED, no replacement of any "
+        "existing 4h slot."
     ),
 }
 
@@ -259,6 +302,16 @@ MULTI_STRATEGY_REGISTRY: list[StrategyDefinition] = [
         strategy_id="S10_MTF_TREND_4H", display_name="Multi-Timeframe Trend Confirmation", timeframe="4h",
         data_mode="CLOSED_CANDLE", production_status="RESEARCH_ONLY",
         make_strategy=lambda: _make_rule_based("S10_MTF_TREND_4H"),
+    ),
+    StrategyDefinition(
+        strategy_id="S11_ZSCORE_REVERSION_15M", display_name="Z-Score Mean Reversion", timeframe="15m",
+        data_mode="CLOSED_CANDLE", production_status="REJECTED",
+        make_strategy=lambda: _make_rule_based("S11_ZSCORE_REVERSION_15M"),
+    ),
+    StrategyDefinition(
+        strategy_id="S12_STRUCTURE_RETEST_4H", display_name="Structure Breakout + Retest", timeframe="4h",
+        data_mode="CLOSED_CANDLE", production_status="REJECTED",
+        make_strategy=lambda: _make_rule_based("S12_STRUCTURE_RETEST_4H"),
     ),
 ]
 
