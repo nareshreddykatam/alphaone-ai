@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.api.config import get_settings
 from database.schema import get_db
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
+from services.scheduler.runner import scheduler
 
 router = APIRouter()
 settings = get_settings()
@@ -38,3 +39,17 @@ async def compute_readiness(db: AsyncSession) -> dict:
 @router.get("/")
 async def health(db: AsyncSession = Depends(get_db)):
     return await compute_readiness(db)
+
+
+@router.get("/scheduler")
+async def scheduler_health():
+    """Read-only scheduler-loop liveness, safe to expose unauthenticated --
+    never a credential, token, or account balance. Added after a real
+    production incident where every DB-writing scheduler job went silent
+    for 12+ minutes with no way to tell, from the outside, whether the
+    job LOOP had stopped iterating versus every attempt merely failing
+    before it could write anything -- see services/scheduler/runner.py's
+    module docstring. `last_tick_at`/`seconds_since_last_tick` answer that
+    directly; `circuit_state`/`consecutive_failures` show the existing
+    per-job CircuitBreaker state."""
+    return scheduler.get_heartbeat()

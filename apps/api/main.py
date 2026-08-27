@@ -9,11 +9,10 @@ from apps.api.routers import api_router
 from apps.api.routers.health import compute_readiness
 from database.schema import engine, Base, get_db
 from services.market_data.live_state import start_market_data_ws, stop_market_data_ws
-from services.scheduler.runner import SchedulerRunner
+from services.scheduler.runner import scheduler
 
 logger = structlog.get_logger()
 settings = get_settings()
-scheduler = SchedulerRunner(settings.coindcx_api_key, settings.coindcx_api_secret)
 
 
 @asynccontextmanager

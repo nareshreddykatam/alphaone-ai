@@ -8,12 +8,30 @@ Each `_run_once_*` method is a single tick, fully testable in isolation
 without running the infinite loop -- the loops themselves
 (`_loop_account_sync` etc.) are thin `while True: tick(); sleep()` wrappers
 around them, started only from `start()`.
+
+Watchdog + heartbeat (added after a real production incident: every
+DB-writing scheduler job went silent for 12+ minutes -- no new SyncEvent
+row, success or failure -- while the CoinDCX WebSocket, which does not
+touch the DB per-tick, kept updating fine; root cause could not be
+confirmed from Railway logs, so this closes every plausible mechanism
+rather than guessing one). Each `_loop` iteration is now bounded by
+`JOB_TICK_TIMEOUT_SECONDS` via `asyncio.wait_for` -- a single stuck DB
+call, connection-pool checkout, or network call can therefore never block
+that job's loop forever; it times out, is logged, and the loop continues
+on schedule. `_last_tick_at` is stamped at the START of every iteration
+(before the job itself runs), independent of success/failure/timeout --
+this is what actually distinguishes "the loop stopped iterating" from
+"the loop is iterating but every job attempt fails before writing
+anything," which black-box DB inspection alone cannot. Exposed read-only
+via GET /api/v1/health/scheduler (apps/api/routers/health.py) -- no
+credentials, matching that router's existing disclosure policy.
 """
 import asyncio
 from datetime import datetime
 
 import structlog
 
+from apps.api.config import get_settings
 from database.schema import async_session
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
 from services.market_data.binance import BinanceExchange
@@ -33,6 +51,10 @@ OUTCOME_EVALUATION_INTERVAL_SECONDS = 900
 CANDLE_INGESTION_INTERVAL_SECONDS = 900  # 15 min -- see services/scheduler/jobs.py's module docstring for the reasoning
 LIVE_BREAKOUT_INTERVAL_SECONDS = 30  # same cadence as account_sync/exit_alert -- see jobs.py's module docstring
 
+# Generous enough for a normal tick (DB round-trip + at most one external
+# API call) under real-world load, but bounded -- see module docstring.
+JOB_TICK_TIMEOUT_SECONDS = 60
+
 
 class SchedulerRunner:
     def __init__(self, api_key: str = "", api_secret: str = ""):
@@ -40,6 +62,10 @@ class SchedulerRunner:
         self._api_secret = api_secret
         self._tasks: list[asyncio.Task] = []
         self._running = False
+        # Stamped at the START of every _loop iteration, before the job
+        # itself runs -- see module docstring. Keys match the `name`
+        # strings passed to _loop() in start().
+        self._last_tick_at: dict[str, datetime] = {}
 
         self.account_sync_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.exit_alert_breaker = CircuitBreaker(config=CircuitBreakerConfig())
@@ -151,22 +177,61 @@ class SchedulerRunner:
             self.live_breakout_breaker.record_failure()
             logger.error("live_breakout_job failed", error=str(e))
 
-    async def _loop(self, tick_fn, interval_seconds: float) -> None:
+    async def _loop(self, name: str, tick_fn, interval_seconds: float) -> None:
         while self._running:
-            await tick_fn()
+            self._last_tick_at[name] = datetime.utcnow()
+            try:
+                await asyncio.wait_for(tick_fn(), timeout=JOB_TICK_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                # tick_fn's own try/except (inside each run_once_* method)
+                # cannot catch this -- wait_for cancels tick_fn() at its
+                # current await point, and CancelledError is a BaseException,
+                # not an Exception, so it never reaches `except Exception`
+                # there. Logged here instead, and the loop continues on its
+                # normal schedule rather than staying stuck.
+                logger.error(
+                    "Scheduler job tick exceeded watchdog timeout -- continuing on schedule",
+                    job=name, timeout_seconds=JOB_TICK_TIMEOUT_SECONDS,
+                )
             await asyncio.sleep(interval_seconds)
+
+    def get_heartbeat(self) -> dict:
+        """Read-only scheduler health, safe to expose over HTTP (no
+        credentials) -- see GET /api/v1/health/scheduler. `last_tick_at`
+        proves the job's loop is actually iterating, independent of
+        whether the job itself is succeeding; `seconds_since_last_tick`
+        makes staleness obvious without the caller doing datetime math."""
+        now = datetime.utcnow()
+        breakers = {
+            "account_sync": self.account_sync_breaker,
+            "exit_alerts": self.exit_alert_breaker,
+            "signal_generation": self.signal_breaker,
+            "outcome_evaluation": self.outcome_breaker,
+            "candle_ingestion": self.candle_ingestion_breaker,
+            "live_breakout": self.live_breakout_breaker,
+        }
+        jobs = {}
+        for name, breaker in breakers.items():
+            last_tick = self._last_tick_at.get(name)
+            jobs[name] = {
+                "last_tick_at": last_tick.isoformat() if last_tick else None,
+                "seconds_since_last_tick": (now - last_tick).total_seconds() if last_tick else None,
+                "circuit_state": breaker.state.value,
+                "consecutive_failures": breaker.consecutive_failures,
+            }
+        return {"scheduler_running": self._running, "jobs": jobs}
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
         self._tasks = [
-            asyncio.create_task(self._loop(self.run_once_account_sync, ACCOUNT_SYNC_INTERVAL_SECONDS)),
-            asyncio.create_task(self._loop(self.run_once_exit_alerts, EXIT_ALERT_INTERVAL_SECONDS)),
-            asyncio.create_task(self._loop(self.run_once_signal_generation, SIGNAL_GENERATION_INTERVAL_SECONDS)),
-            asyncio.create_task(self._loop(self.run_once_outcome_evaluation, OUTCOME_EVALUATION_INTERVAL_SECONDS)),
-            asyncio.create_task(self._loop(self.run_once_candle_ingestion, CANDLE_INGESTION_INTERVAL_SECONDS)),
-            asyncio.create_task(self._loop(self.run_once_live_breakout, LIVE_BREAKOUT_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop("account_sync", self.run_once_account_sync, ACCOUNT_SYNC_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop("exit_alerts", self.run_once_exit_alerts, EXIT_ALERT_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop("signal_generation", self.run_once_signal_generation, SIGNAL_GENERATION_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop("outcome_evaluation", self.run_once_outcome_evaluation, OUTCOME_EVALUATION_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop("candle_ingestion", self.run_once_candle_ingestion, CANDLE_INGESTION_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop("live_breakout", self.run_once_live_breakout, LIVE_BREAKOUT_INTERVAL_SECONDS)),
         ]
         logger.info("Scheduler started", jobs=len(self._tasks))
 
@@ -181,3 +246,15 @@ class SchedulerRunner:
                 pass
         self._tasks = []
         logger.info("Scheduler stopped")
+
+
+# Process-wide singleton, constructed here (not in apps/api/main.py) so
+# routers (e.g. apps/api/routers/health.py, for GET /health/scheduler) can
+# import it directly without a circular import back through main.py --
+# same reasoning as services/market_data/live_state.py's `market_ws`
+# singleton. apps/api/main.py imports this instead of constructing its own
+# SchedulerRunner. `apps.api.config` is already an existing transitive
+# dependency of this module (via `database.schema`), so importing it at
+# module scope here introduces no new import-order risk.
+_settings = get_settings()
+scheduler = SchedulerRunner(_settings.coindcx_api_key, _settings.coindcx_api_secret)

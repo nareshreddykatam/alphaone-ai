@@ -262,6 +262,139 @@ async def test_live_breakout_uses_a_persistent_aggregator_shared_across_ticks(pa
     assert seen_aggregators[0] is runner._live_candle_aggregator
 
 
+# ---- Watchdog + heartbeat (added after a real production incident where
+# every DB-writing scheduler job went silent for 12+ minutes with no way
+# to tell, from the outside, whether the job LOOP had stopped iterating
+# versus every attempt merely failing before writing anything) ----
+
+@pytest.mark.asyncio
+async def test_loop_watchdog_times_out_a_hung_tick_and_keeps_iterating(monkeypatch):
+    """A tick_fn that hangs forever must never block _loop() forever -- the
+    watchdog times it out (logged, not raised) and the loop proceeds to
+    its next scheduled iteration instead of staying stuck."""
+    import services.scheduler.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "JOB_TICK_TIMEOUT_SECONDS", 0.05)
+    runner = SchedulerRunner()
+    runner._running = True
+    call_count = {"n": 0}
+
+    async def _hangs_forever():
+        call_count["n"] += 1
+        await asyncio.sleep(999)  # would block the loop forever without the watchdog
+
+    loop_task = asyncio.create_task(runner._loop("test_job", _hangs_forever, 0.01))
+    try:
+        await asyncio.sleep(0.3)  # several watchdog-timeout cycles
+    finally:
+        runner._running = False
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+    assert call_count["n"] >= 2, "the loop must re-invoke tick_fn after each timeout, not stay stuck on the first hang"
+
+
+@pytest.mark.asyncio
+async def test_loop_watchdog_does_not_fire_for_a_normal_fast_tick(monkeypatch):
+    """A tick_fn that completes quickly must run to completion normally --
+    the watchdog must never interrupt legitimate, fast work."""
+    import services.scheduler.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "JOB_TICK_TIMEOUT_SECONDS", 5.0)
+    runner = SchedulerRunner()
+    runner._running = True
+    completed = {"n": 0}
+
+    async def _fast():
+        completed["n"] += 1
+
+    loop_task = asyncio.create_task(runner._loop("test_job", _fast, 0.01))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        runner._running = False
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+    assert completed["n"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_is_null_before_any_tick():
+    runner = SchedulerRunner()
+    hb = runner.get_heartbeat()
+    assert hb["scheduler_running"] is False
+    for job_name in ("account_sync", "exit_alerts", "signal_generation", "outcome_evaluation", "candle_ingestion", "live_breakout"):
+        assert hb["jobs"][job_name]["last_tick_at"] is None
+        assert hb["jobs"][job_name]["seconds_since_last_tick"] is None
+        assert hb["jobs"][job_name]["circuit_state"] == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_last_tick_at_advances_as_the_loop_iterates(patched_session, monkeypatch):
+    """last_tick_at is stamped at the START of every _loop iteration --
+    proving loop liveness independently of whether the underlying job
+    succeeds, fails, or times out."""
+    async def _fake_job(session, provider):
+        return {"balance": {"status": "OK"}, "positions": None}
+
+    monkeypatch.setattr("services.scheduler.runner.account_sync_job", _fake_job)
+    runner = SchedulerRunner()
+    runner._running = True
+
+    assert runner.get_heartbeat()["jobs"]["account_sync"]["last_tick_at"] is None
+
+    loop_task = asyncio.create_task(runner._loop("account_sync", runner.run_once_account_sync, 0.01))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        runner._running = False
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+    hb = runner.get_heartbeat()["jobs"]["account_sync"]
+    assert hb["last_tick_at"] is not None
+    assert hb["seconds_since_last_tick"] < 10
+    assert hb["circuit_state"] == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_reflects_circuit_breaker_failures(patched_session, monkeypatch):
+    async def _boom(session, provider):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("services.scheduler.runner.account_sync_job", _boom)
+    runner = SchedulerRunner()
+    for _ in range(3):
+        await runner.run_once_account_sync()
+
+    hb = runner.get_heartbeat()["jobs"]["account_sync"]
+    assert hb["consecutive_failures"] == 3
+    assert hb["circuit_state"] == "CLOSED"  # below failure_threshold (5) -- not yet OPEN
+
+
+def test_scheduler_singleton_is_wired_into_main_and_health_router():
+    """apps/api/main.py and apps/api/routers/health.py must both reference
+    the SAME process-wide scheduler instance (services/scheduler/runner.py)
+    -- never a second, independently-constructed SchedulerRunner that would
+    silently duplicate jobs or report a heartbeat for the wrong instance."""
+    from services.scheduler.runner import scheduler
+    from apps.api.main import scheduler as main_scheduler
+    from apps.api.routers.health import scheduler as health_scheduler
+
+    assert main_scheduler is scheduler
+    assert health_scheduler is scheduler
+
+
 def test_live_breakout_aggregator_is_specifically_the_4h_registry_entry():
     """The scheduler's live-signal detection stays 4h-only even though the
     live_state registry now holds an aggregator per supported timeframe
