@@ -6,6 +6,7 @@ from database.schema import get_db
 from database.schema.models import Signal, SignalOutcome
 from services.exchange.fx import get_usdt_inr_rate, convert_usdt_to_inr, conversion_meta
 from services.signal_engine.live_signal import generate_and_persist_signal
+from services.signal_engine.multi_strategy import get_definition_by_persisted_name
 from services.signal_engine.outcome_evaluator import evaluate_pending_signal_outcomes
 from services.signal_engine.notify import notify_new_signal
 
@@ -17,16 +18,38 @@ _USDT_PRICE_FIELDS = ("entry_price", "stop_loss", "take_profit_1", "take_profit_
 
 
 def _serialize(signal: Signal, rate=None) -> dict:
+    definition = get_definition_by_persisted_name(signal.strategy_name)
     return {
         "signal_id": signal.signal_id, "timestamp": signal.timestamp, "symbol": signal.symbol,
+        "timeframe": signal.timeframe or (definition.timeframe if definition else None),
         "signal_type": signal.signal_type, "entry_price": signal.entry_price, "stop_loss": signal.stop_loss,
         "take_profit_1": signal.take_profit_1, "take_profit_2": signal.take_profit_2,
         "take_profit_3": signal.take_profit_3, "risk_reward": signal.risk_reward,
         "market_regime": signal.market_regime, "reasoning": signal.reasoning,
         "quality": signal.quality, "strategy_name": signal.strategy_name,
+        "strategy_id": definition.strategy_id if definition else signal.strategy_name,
+        "strategy_display_name": definition.display_name if definition else signal.strategy_name,
         "model_version": signal.model_version, "is_active": signal.is_active,
         **{f"{field}_inr": convert_usdt_to_inr(getattr(signal, field), rate) for field in _USDT_PRICE_FIELDS},
         **conversion_meta(rate),
+    }
+
+
+@router.get("/strategies")
+async def list_strategies():
+    """The full 10-strategy registry (services/signal_engine/multi_strategy.py)
+    -- for the frontend's Signal History strategy filter. production_status
+    tells the frontend/user which strategies can actually generate a live
+    signal (PRODUCTION_ELIGIBLE) versus which exist for research only."""
+    from services.signal_engine.multi_strategy import MULTI_STRATEGY_REGISTRY
+    return {
+        "strategies": [
+            {
+                "strategy_id": d.strategy_id, "display_name": d.display_name, "timeframe": d.timeframe,
+                "data_mode": d.data_mode, "production_status": d.production_status,
+            }
+            for d in MULTI_STRATEGY_REGISTRY
+        ]
     }
 
 

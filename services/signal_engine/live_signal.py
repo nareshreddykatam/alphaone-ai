@@ -4,16 +4,22 @@ the scheduler's periodic signal_generation_job. Returns None rather than
 fabricating anything when there isn't enough real data.
 
 Dedup guard: before persisting a new LONG/SHORT signal, checks whether one
-already exists for this EXACT (symbol, candle timestamp). Without this, a
-15-minute scheduler re-run against a candle that hasn't closed yet (the
-Donchian breakout condition is still true, nothing new happened) would
-insert a fresh Signal row -- and since Telegram dedup
+already exists for this EXACT (symbol, timeframe, strategy_name, candle
+timestamp). Without this, a 15-minute scheduler re-run against a candle
+that hasn't closed yet (the breakout condition is still true, nothing new
+happened) would insert a fresh Signal row -- and since Telegram dedup
 (services/signal_engine/notify.py) keys on signal_id, which is always a
 new UUID, that would trigger a NEW Telegram alert every 15 minutes for the
-same still-standing breakout. This guard makes "one signal per candle" a
-real, restart-safe (DB-backed, not in-memory) invariant shared by both
-this scheduled path and services/signal_engine/live_breakout.py's
-intrabar path.
+same still-standing breakout. This guard makes "one signal per strategy
+per candle" a real, restart-safe (DB-backed, not in-memory) invariant
+shared by every strategy/timeframe path.
+
+`strategy_name` and `timeframe` were added to this key when the
+multi-strategy system (services/signal_engine/multi_strategy.py) started
+running several independent strategies against the SAME candle stream --
+a (symbol, timestamp)-only key would have made a second strategy's
+genuinely independent LONG signal look like a duplicate of a first
+strategy's SHORT signal on that same candle, and silently suppress it.
 """
 from datetime import datetime
 from typing import Optional
@@ -69,16 +75,22 @@ async def _load_recent_candles(session: AsyncSession, symbol: str, timeframe: st
     )
 
 
-async def signal_already_exists_for_candle(session: AsyncSession, symbol: str, timestamp: datetime) -> bool:
+async def signal_already_exists_for_candle(
+    session: AsyncSession, symbol: str, timeframe: str, strategy_name: str, timestamp: datetime,
+) -> bool:
     """The shared dedup guard: is there already a non-NO_TRADE Signal row
-    for this exact (symbol, candle timestamp)? A real DB query, not
-    in-memory state, so this is safe across process restarts and shared
-    correctly between the scheduled (closed-candle) and live (intrabar)
-    paths -- whichever one detects a breakout first "wins" and the other
-    naturally no-ops rather than sending a duplicate alert."""
+    for this exact (symbol, timeframe, strategy_name, candle timestamp)? A
+    real DB query, not in-memory state, so this is safe across process
+    restarts and shared correctly between the scheduled (closed-candle)
+    and live (intrabar) paths -- whichever one detects a breakout first
+    "wins" and the other naturally no-ops rather than sending a duplicate
+    alert. Scoped to `strategy_name` (and `timeframe`) so a DIFFERENT
+    strategy's genuinely independent signal on the same candle is never
+    mistaken for a duplicate -- see module docstring."""
     result = await session.execute(
         select(Signal).where(
-            Signal.symbol == symbol, Signal.timestamp == timestamp, Signal.signal_type != "NO_TRADE",
+            Signal.symbol == symbol, Signal.timeframe == timeframe, Signal.strategy_name == strategy_name,
+            Signal.timestamp == timestamp, Signal.signal_type != "NO_TRADE",
         )
     )
     return result.scalar_one_or_none() is not None
@@ -88,6 +100,7 @@ async def _persist_new_signal(
     session: AsyncSession,
     result: StrategySignal,
     symbol: str,
+    timeframe: str,
     timestamp: datetime,
     regime: str,
     reasoning: str,
@@ -106,6 +119,7 @@ async def _persist_new_signal(
         signal_id=f"SIG-{uuid.uuid4().hex[:12].upper()}",
         timestamp=timestamp,
         symbol=symbol,
+        timeframe=timeframe,
         signal_type=result.signal_type,
         confidence=0.0,  # deliberately unused for a rule-based strategy; see `quality`
         entry_price=result.entry_price,
@@ -153,8 +167,10 @@ async def generate_and_persist_signal(
     result = strategy.generate(df)
     candle_timestamp = df.iloc[-1]["timestamp"]
 
-    if result.signal_type != "NO_TRADE" and await signal_already_exists_for_candle(session, symbol, candle_timestamp):
+    if result.signal_type != "NO_TRADE" and await signal_already_exists_for_candle(
+        session, symbol, timeframe, result.strategy_name, candle_timestamp,
+    ):
         return None  # this breakout was already alerted (scheduled or live) -- do not duplicate
 
     regime = MarketRegimeDetector().detect(df)
-    return await _persist_new_signal(session, result, symbol, candle_timestamp, regime, result.reasoning)
+    return await _persist_new_signal(session, result, symbol, timeframe, candle_timestamp, regime, result.reasoning)

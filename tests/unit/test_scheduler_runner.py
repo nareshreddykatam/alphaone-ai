@@ -88,7 +88,7 @@ async def test_outcome_evaluation_tick_handles_no_data_gracefully(patched_sessio
 async def test_start_and_stop_lifecycle_creates_and_cancels_all_jobs(patched_session):
     runner = SchedulerRunner()
     runner.start()
-    assert len(runner._tasks) == 6
+    assert len(runner._tasks) == 7  # +1 for signal_generation_15m (multi-strategy system)
     assert all(not t.done() for t in runner._tasks)
 
     await runner.stop()

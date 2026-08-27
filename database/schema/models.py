@@ -295,6 +295,17 @@ class Signal(Base):
     is_active = Column(Boolean, default=True)
     quality = Column(String(10), nullable=True)
     strategy_name = Column(String(50), nullable=True)
+    # Added for the multi-strategy system (10 independent strategies across
+    # 15m/4h) -- lets the dedup guard (services/signal_engine/live_signal.py:
+    # signal_already_exists_for_candle) scope "same event" to
+    # (symbol, timeframe, strategy_name, timestamp) instead of just
+    # (symbol, timestamp), which would otherwise treat two DIFFERENT
+    # strategies firing on the same candle as duplicates of each other.
+    # Nullable: existing rows predating this column (all S05/4h) are left
+    # NULL rather than backfilled with a guess -- see
+    # database/schema/migrations.py for how this column is added to an
+    # already-existing production table.
+    timeframe = Column(String(10), nullable=True)
     model_version = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 

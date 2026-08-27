@@ -8,8 +8,14 @@ published rate-limit table, see docs/coindcx_api_findings.md, so these
 default to conservative values rather than guessing an aggressive one):
 - account_sync_job: every 30s (balance + positions)
 - exit_alert_job: every 30s (only meaningful once a live price exists)
-- signal_generation_job: every 15 min (the primary strategy runs on 4h
-  bars; checking more often than that just re-evaluates the same bar)
+- signal_generation_job: every 15 min for "4h" (the primary strategy runs
+  on 4h bars; checking more often than that just re-evaluates the same
+  bar) and, separately, every 15 min for "15m" (a 15m candle closes every
+  15 minutes, so this is exactly one check per new bar -- see
+  services/signal_engine/multi_strategy.py: currently every 15m strategy
+  is RESEARCH_ONLY, so this tick is presently a no-op in production, but
+  the plumbing exists so a future validated 15m strategy needs no new
+  scheduler wiring, only a production_status flip)
 - outcome_evaluation_job: every 15 min
 - candle_ingestion_job: every 15 min (a 4h candle only closes every 4
   hours, so this is ~16 checks per real candle -- not aggressive; each
@@ -40,7 +46,7 @@ from services.market_data.coindcx_ws import CoinDCXMarketDataWebSocket
 from services.market_data.ingestion import DataIngestionService
 from services.position_monitor.monitor import get_new_exit_alerts
 from services.signal_engine.live_breakout import LiveCandleAggregator, evaluate_live_breakout
-from services.signal_engine.live_signal import generate_and_persist_signal
+from services.signal_engine.multi_strategy_engine import evaluate_all_strategies_for_timeframe
 from services.signal_engine.notify import notify_new_signal
 from services.signal_engine.outcome_evaluator import evaluate_pending_signal_outcomes
 
@@ -78,8 +84,19 @@ async def exit_alert_job(session: AsyncSession, symbol: str = "BTC/USDT", curren
     return await get_new_exit_alerts(session, current_price=price, symbol=symbol)
 
 
-async def signal_generation_job(session: AsyncSession, symbol: str = "BTC/USDT", timeframe: str = "4h"):
-    return await generate_and_persist_signal(session, symbol=symbol, timeframe=timeframe)
+async def signal_generation_job(session: AsyncSession, symbol: str = "BTC/USDT", timeframe: str = "4h") -> list:
+    """Evaluates every PRODUCTION_ELIGIBLE strategy registered for
+    `timeframe` (services/signal_engine/multi_strategy.py) independently
+    against real closed candles -- not just the single existing S05
+    baseline anymore. Notifies Telegram for each newly-persisted signal:
+    this is the ONLY path a CLOSED_CANDLE-only strategy (e.g. S06, which
+    has no live_breakout-style intrabar detector) can ever reach Telegram
+    through, so this call is not optional -- without it, such a strategy
+    could persist a real signal and never alert anyone."""
+    signals = await evaluate_all_strategies_for_timeframe(session, symbol, timeframe)
+    for signal in signals:
+        await notify_new_signal(session, signal)
+    return signals
 
 
 async def outcome_evaluation_job(session: AsyncSession, symbol: str = "BTC/USDT", timeframe: str = "4h") -> int:

@@ -8,6 +8,7 @@ from apps.api.config import get_settings
 from apps.api.routers import api_router
 from apps.api.routers.health import compute_readiness
 from database.schema import engine, Base, get_db
+from database.schema.migrations import run_schema_migrations
 from services.market_data.live_state import start_market_data_ws, stop_market_data_ws
 from services.scheduler.runner import scheduler
 
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI):
     logger.info("AlphaOne BTC AI starting up", mode=settings.trading_mode)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await run_schema_migrations(conn)
     if settings.scheduler_enabled:
         # Must run on a persistent process, never inside a serverless
         # function -- see docs/deployment.md.

@@ -86,8 +86,18 @@ class TelegramBot:
         if signal.get("take_profit_3") is not None:
             tp_lines.append(f"TP3:\n{level(signal.get('take_profit_3'))}")
 
+        # Every independently-firing strategy (services/signal_engine/
+        # multi_strategy.py) gets its OWN message, clearly labeled with
+        # which strategy + timeframe fired -- never merged with another
+        # strategy's signal, never implying consensus.
+        strategy_id = signal.get("strategy_id") or signal.get("strategy_name", "trend_following_donchian_adx")
+        strategy_display = signal.get("strategy_display_name", strategy_id)
+        timeframe = signal.get("timeframe") or "4h"
+
         text = (
-            f"🚨 BTC/USDT PERPETUAL — {signal_type}\n\n"
+            f"🚨 BTC/USDT FUTURES\n\n"
+            f"Strategy: {strategy_id} — {strategy_display}\n"
+            f"Timeframe: {timeframe}\n\n"
             f"{emoji} {signal_type}\n\n"
             f"Market:\nCoinDCX BTC/USDT Perpetual\n\n"
             f"Quality: {signal.get('quality', 'LOW')} (categorical, not an accuracy guarantee)\n\n"
@@ -97,7 +107,6 @@ class TelegramBot:
             f"Risk/Reward:\n1 : {signal.get('risk_reward', 0)}\n\n"
             f"Market Regime:\n{signal.get('market_regime', 'UNKNOWN')}\n\n"
             f"Reason:\n{signal.get('reasoning', '')}\n\n"
-            f"Strategy:\n{signal.get('strategy_name', 'trend_following_donchian_adx')}\n\n"
             f"Price source:\nCoinDCX Live Market Data\n\n"
             f"Signal ID:\n{signal.get('signal_id', 'unknown')}\n\n"
             f"MANUAL EXECUTION REQUIRED -- you execute this manually on CoinDCX, AlphaOne does not place orders."

@@ -24,7 +24,7 @@ async def test_scheduler_health_endpoint_returns_expected_shape(client):
     body = resp.json()
     assert "scheduler_running" in body
     assert set(body["jobs"].keys()) == {
-        "account_sync", "exit_alerts", "signal_generation",
+        "account_sync", "exit_alerts", "signal_generation", "signal_generation_15m",
         "outcome_evaluation", "candle_ingestion", "live_breakout",
     }
     for job in body["jobs"].values():

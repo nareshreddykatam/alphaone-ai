@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.schema.models import Signal, NotificationLog
+from services.signal_engine.multi_strategy import get_definition_by_persisted_name
 
 
 def _dedup_key(signal_id: str) -> str:
@@ -16,6 +17,11 @@ def _dedup_key(signal_id: str) -> str:
 
 
 def _serialize_for_telegram(signal: Signal) -> dict:
+    # Reverse-looked-up display name/strategy_id for the Telegram header
+    # ("Strategy: S06 -- Supertrend + ATR") -- falls back to the raw
+    # strategy_name string for a signal whose strategy isn't (or is no
+    # longer) in the registry, rather than guessing.
+    definition = get_definition_by_persisted_name(signal.strategy_name)
     return {
         "signal_id": signal.signal_id, "signal_type": signal.signal_type,
         "quality": signal.quality, "entry_price": signal.entry_price,
@@ -23,6 +29,9 @@ def _serialize_for_telegram(signal: Signal) -> dict:
         "take_profit_2": signal.take_profit_2, "take_profit_3": signal.take_profit_3,
         "risk_reward": signal.risk_reward, "market_regime": signal.market_regime,
         "reasoning": signal.reasoning, "strategy_name": signal.strategy_name,
+        "strategy_id": definition.strategy_id if definition else signal.strategy_name,
+        "strategy_display_name": definition.display_name if definition else signal.strategy_name,
+        "timeframe": signal.timeframe or (definition.timeframe if definition else None),
     }
 
 

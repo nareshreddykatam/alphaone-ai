@@ -140,7 +140,7 @@ async def evaluate_live_breakout(
     if forming.open_time != expected_forming_open:
         return None
 
-    if await signal_already_exists_for_candle(session, symbol, forming.open_time):
+    if await signal_already_exists_for_candle(session, symbol, timeframe, BaselineStrategy.name, forming.open_time):
         return None  # already alerted (or confirmed) this exact candle -- edge-triggered, not repeated
 
     combined = pd.concat(
@@ -167,4 +167,4 @@ async def evaluate_live_breakout(
         f"Will be confirmed (or superseded) when the candle closes and the scheduled evaluation runs; "
         f"no duplicate alert will fire for the same candle either way.]"
     )
-    return await _persist_new_signal(session, result, symbol, forming.open_time, regime, reasoning)
+    return await _persist_new_signal(session, result, symbol, timeframe, forming.open_time, regime, reasoning)

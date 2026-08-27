@@ -135,7 +135,7 @@ async def test_signal_already_exists_for_candle_ignores_no_trade_rows(session_ma
         first = await generate_and_persist_signal(session)  # real strategy -- may be NO_TRADE or a real direction
         assert first is not None
 
-        exists = await signal_already_exists_for_candle(session, "BTC/USDT", first.timestamp)
+        exists = await signal_already_exists_for_candle(session, "BTC/USDT", "4h", first.strategy_name, first.timestamp)
         assert exists == (first.signal_type != "NO_TRADE")
 
 
@@ -174,3 +174,54 @@ async def test_send_signal_is_a_noop_for_no_trade():
     bot._send = fake_send
     await bot.send_signal({"signal_id": "SIG-1", "signal_type": "NO_TRADE"})
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_signal_includes_strategy_and_timeframe_header():
+    """Every independently-firing strategy's Telegram message must clearly
+    state WHICH strategy and timeframe fired -- never implying consensus
+    or leaving the source ambiguous when multiple strategies are live."""
+    from services.telegram.bot import TelegramBot
+
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    bot.enabled = True
+    sent = {}
+
+    async def fake_send(text):
+        sent["text"] = text
+
+    bot._send = fake_send
+    await bot.send_signal({
+        "signal_id": "SIG-XYZ", "signal_type": "SHORT", "quality": "MEDIUM",
+        "entry_price": 79800.0, "stop_loss": 80200.0, "take_profit_1": 79000.0,
+        "risk_reward": 2.0, "market_regime": "TRENDING_BEARISH", "reasoning": "test reasoning",
+        "strategy_id": "S06_SUPERTREND_ATR_4H", "strategy_display_name": "Supertrend + ATR",
+        "timeframe": "4h",
+    })
+    assert "Strategy: S06_SUPERTREND_ATR_4H" in sent["text"]
+    assert "Supertrend + ATR" in sent["text"]
+    assert "Timeframe: 4h" in sent["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_signal_falls_back_gracefully_without_strategy_metadata():
+    """A caller that doesn't pass strategy_id/timeframe (e.g. an older code
+    path) must still produce a valid message, defaulting to the raw
+    strategy_name and 4h -- never crash."""
+    from services.telegram.bot import TelegramBot
+
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    bot.enabled = True
+    sent = {}
+
+    async def fake_send(text):
+        sent["text"] = text
+
+    bot._send = fake_send
+    await bot.send_signal({
+        "signal_id": "SIG-OLD", "signal_type": "LONG", "quality": "LOW",
+        "entry_price": 100.0, "stop_loss": 90.0, "take_profit_1": 120.0,
+        "risk_reward": 2.0, "market_regime": "UNCERTAIN", "reasoning": "legacy call",
+    })
+    assert "Strategy: trend_following_donchian_adx" in sent["text"]
+    assert "Timeframe: 4h" in sent["text"]

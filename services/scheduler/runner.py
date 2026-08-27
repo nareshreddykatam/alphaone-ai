@@ -47,6 +47,7 @@ logger = structlog.get_logger()
 ACCOUNT_SYNC_INTERVAL_SECONDS = 30
 EXIT_ALERT_INTERVAL_SECONDS = 30
 SIGNAL_GENERATION_INTERVAL_SECONDS = 900  # 15 min -- primary strategy is 4h, no value in checking more often
+SIGNAL_GENERATION_15M_INTERVAL_SECONDS = 900  # 15 min -- exactly one check per new 15m candle; see jobs.py
 OUTCOME_EVALUATION_INTERVAL_SECONDS = 900
 CANDLE_INGESTION_INTERVAL_SECONDS = 900  # 15 min -- see services/scheduler/jobs.py's module docstring for the reasoning
 LIVE_BREAKOUT_INTERVAL_SECONDS = 30  # same cadence as account_sync/exit_alert -- see jobs.py's module docstring
@@ -70,6 +71,7 @@ class SchedulerRunner:
         self.account_sync_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.exit_alert_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.signal_breaker = CircuitBreaker(config=CircuitBreakerConfig())
+        self.signal_breaker_15m = CircuitBreaker(config=CircuitBreakerConfig())
         self.outcome_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.candle_ingestion_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.live_breakout_breaker = CircuitBreaker(config=CircuitBreakerConfig())
@@ -130,11 +132,28 @@ class SchedulerRunner:
             return
         try:
             async with async_session() as session:
-                await signal_generation_job(session)
+                await signal_generation_job(session, timeframe="4h")
             self.signal_breaker.record_success()
         except Exception as e:
             self.signal_breaker.record_failure()
-            logger.error("signal_generation_job failed", error=str(e))
+            logger.error("signal_generation_job failed", error=str(e), timeframe="4h")
+
+    async def run_once_signal_generation_15m(self) -> None:
+        """Independent tick + breaker from the 4h path -- a failure
+        evaluating 15m strategies must never affect the 4h path's own
+        breaker/schedule, and vice versa. Currently a no-op in production
+        (every registered 15m strategy is RESEARCH_ONLY, see
+        services/signal_engine/multi_strategy.py) but ticks for real so a
+        future production-eligible 15m strategy needs no new wiring."""
+        if not self.signal_breaker_15m.can_attempt():
+            return
+        try:
+            async with async_session() as session:
+                await signal_generation_job(session, timeframe="15m")
+            self.signal_breaker_15m.record_success()
+        except Exception as e:
+            self.signal_breaker_15m.record_failure()
+            logger.error("signal_generation_job failed", error=str(e), timeframe="15m")
 
     async def run_once_outcome_evaluation(self) -> None:
         if not self.outcome_breaker.can_attempt():
@@ -206,6 +225,7 @@ class SchedulerRunner:
             "account_sync": self.account_sync_breaker,
             "exit_alerts": self.exit_alert_breaker,
             "signal_generation": self.signal_breaker,
+            "signal_generation_15m": self.signal_breaker_15m,
             "outcome_evaluation": self.outcome_breaker,
             "candle_ingestion": self.candle_ingestion_breaker,
             "live_breakout": self.live_breakout_breaker,
@@ -229,6 +249,7 @@ class SchedulerRunner:
             asyncio.create_task(self._loop("account_sync", self.run_once_account_sync, ACCOUNT_SYNC_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop("exit_alerts", self.run_once_exit_alerts, EXIT_ALERT_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop("signal_generation", self.run_once_signal_generation, SIGNAL_GENERATION_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop("signal_generation_15m", self.run_once_signal_generation_15m, SIGNAL_GENERATION_15M_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop("outcome_evaluation", self.run_once_outcome_evaluation, OUTCOME_EVALUATION_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop("candle_ingestion", self.run_once_candle_ingestion, CANDLE_INGESTION_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop("live_breakout", self.run_once_live_breakout, LIVE_BREAKOUT_INTERVAL_SECONDS)),

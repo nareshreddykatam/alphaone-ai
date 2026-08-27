@@ -118,6 +118,71 @@ def vwap_session(
     return cum_tp_vol / cum_vol.replace(0, np.nan)
 
 
+def supertrend(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 10, multiplier: float = 3.0,
+) -> tuple[pd.Series, pd.Series]:
+    """Standard ATR-based Supertrend. Returns (supertrend_line, direction)
+    where direction is +1 (uptrend, line acts as support below price) or -1
+    (downtrend, line acts as resistance above price). Strictly causal: each
+    row only ever uses `atr`/`close`/band values through that same row, and
+    the recursive band-tightening rule only looks at the immediately prior
+    row -- standard Supertrend construction, no future data.
+    """
+    atr_val = atr(high, low, close, period)
+    hl2 = (high + low) / 2
+    basic_upper = hl2 + multiplier * atr_val
+    basic_lower = hl2 - multiplier * atr_val
+
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    direction = pd.Series(1, index=close.index, dtype=int)
+    line = pd.Series(np.nan, index=close.index, dtype=float)
+
+    for i in range(len(close)):
+        if pd.isna(atr_val.iloc[i]):
+            # ATR itself isn't established yet (first `period` rows) --
+            # nothing meaningful to compute; leave the line NaN.
+            direction.iloc[i] = 1
+            line.iloc[i] = np.nan
+            continue
+
+        if i == 0 or pd.isna(final_upper.iloc[i - 1]) or pd.isna(final_lower.iloc[i - 1]):
+            # First row with a valid ATR (or a genuine first row): there is
+            # no real previous band to tighten against yet -- start fresh
+            # from the basic bands rather than comparing against a NaN
+            # (which would silently propagate NaN, and therefore a stuck
+            # `direction`, through every subsequent row forever).
+            final_upper.iloc[i] = basic_upper.iloc[i]
+            final_lower.iloc[i] = basic_lower.iloc[i]
+            direction.iloc[i] = 1
+            line.iloc[i] = final_lower.iloc[i]
+            continue
+
+        # Bands only ever tighten toward price (never widen back out) unless
+        # price closes through the opposite band -- the standard rule that
+        # keeps Supertrend from whipsawing on every minor pullback.
+        final_upper.iloc[i] = (
+            basic_upper.iloc[i]
+            if basic_upper.iloc[i] < final_upper.iloc[i - 1] or close.iloc[i - 1] > final_upper.iloc[i - 1]
+            else final_upper.iloc[i - 1]
+        )
+        final_lower.iloc[i] = (
+            basic_lower.iloc[i]
+            if basic_lower.iloc[i] > final_lower.iloc[i - 1] or close.iloc[i - 1] < final_lower.iloc[i - 1]
+            else final_lower.iloc[i - 1]
+        )
+
+        prev_dir = direction.iloc[i - 1]
+        if prev_dir == 1:
+            direction.iloc[i] = -1 if close.iloc[i] < final_lower.iloc[i] else 1
+        else:
+            direction.iloc[i] = 1 if close.iloc[i] > final_upper.iloc[i] else -1
+
+        line.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+
+    return line, direction
+
+
 def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
