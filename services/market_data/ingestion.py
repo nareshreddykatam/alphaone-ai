@@ -101,7 +101,19 @@ class DataIngestionService:
     async def _backfill_range(
         self, symbol: str, timeframe: str, range_start: datetime, range_end: datetime, page_limit: int,
     ) -> int:
-        """Paginate fetch_ohlcv forward across exactly [range_start, range_end]."""
+        """Paginate fetch_ohlcv forward across exactly [range_start, range_end].
+
+        Never persists a still-forming (not yet closed) candle as though it
+        were completed historical data: ccxt/Binance commonly return the
+        currently-in-progress candle as the last page entry once the
+        requested window reaches "now" (observed live during the live-price
+        audit -- the most recently stored 4h candle disagreed with the
+        independently-computed live forming candle for the same bucket).
+        Generic across every timeframe via TIMEFRAME_TO_TIMEDELTA -- no
+        `if timeframe == "4h"` special-casing. For a fully historical range
+        (range_end already in the past) this filter is always a no-op,
+        since every returned candle's bucket has already closed.
+        """
         interval = TIMEFRAME_TO_TIMEDELTA.get(timeframe, timedelta(minutes=1))
         since = range_start
         total_stored = 0
@@ -122,11 +134,26 @@ class DataIngestionService:
                 since += interval * page_limit
                 continue
 
+            now = datetime.utcnow()
+            complete = [c for c in candles if c.timestamp + interval <= now]
+
+            if not complete:
+                # Only a still-forming candle was returned -- nothing safe to
+                # store yet. Stop WITHOUT advancing `since` past it, so the
+                # next backfill() call (e.g. the next candle_ingestion_job
+                # tick) re-fetches this exact bucket once it has actually
+                # closed, rather than skipping it forever.
+                logger.info(
+                    "Backfill reached the live edge -- newest candle not yet closed, stopping",
+                    symbol=symbol, timeframe=timeframe, since=since,
+                )
+                break
+
             consecutive_empty_pages = 0
-            stored = await self._bulk_insert_candles(symbol, timeframe, candles)
+            stored = await self._bulk_insert_candles(symbol, timeframe, complete)
             total_stored += stored
 
-            last_ts = candles[-1].timestamp
+            last_ts = complete[-1].timestamp
             if last_ts < since:
                 logger.warning("Backfill made no forward progress, stopping", symbol=symbol, timeframe=timeframe)
                 break

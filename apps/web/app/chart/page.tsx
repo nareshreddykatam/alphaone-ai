@@ -5,7 +5,11 @@ import { Navigation } from "@/components/Navigation"
 import { formatINR, formatUSDT } from "@/lib/currency"
 
 const API = process.env.NEXT_PUBLIC_API_URL
-const TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+// Every timeframe the backend's live forming-candle registry supports
+// (services/market_data/live_state.py: SUPPORTED_LIVE_TIMEFRAMES) -- the
+// chart is not limited to 4h just because that's the only validated
+// signal timeframe.
+const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
 // Distinct color for the currently-forming (not-yet-closed) candle, so it
 // never looks like an ordinary completed green/red bar -- see Phase 6:
@@ -114,30 +118,29 @@ export default function ChartPage() {
         setLoading(false)
 
         // Poll for a fresh forming candle without re-downloading/re-rendering
-        // the whole historical series -- only the timeframe the shared
-        // aggregator tracks (4h) will ever come back with a non-null
-        // forming_candle (see apps/api/routers/market.py).
-        if (timeframe === "4h") {
-          pollTimer = setInterval(async () => {
-            try {
-              const pollRes = await fetch(`${API}/api/v1/market/candles?symbol=BTC/USDT&timeframe=4h&limit=1`)
-              const pollJson = await pollRes.json()
-              if (cancelled) return
-              setMarketDataStatus(pollJson.market_data_status ?? null)
-              setFormingCandle(pollJson.forming_candle ?? null)
-              if (pollJson.forming_candle) {
-                series.update({
-                  time: pollJson.forming_candle.time,
-                  open: pollJson.forming_candle.open, high: pollJson.forming_candle.high,
-                  low: pollJson.forming_candle.low, close: pollJson.forming_candle.close,
-                  color: FORMING_CANDLE_COLOR, borderColor: FORMING_CANDLE_COLOR, wickColor: FORMING_CANDLE_COLOR,
-                })
-              }
-            } catch (e) {
-              console.error("Failed to poll live forming candle:", e)
+        // the whole historical series. Every timeframe in TIMEFRAMES has its
+        // own live aggregator on the backend (services/market_data/
+        // live_state.py: SUPPORTED_LIVE_TIMEFRAMES) so this polls whichever
+        // timeframe is currently selected, not just 4h.
+        pollTimer = setInterval(async () => {
+          try {
+            const pollRes = await fetch(`${API}/api/v1/market/candles?symbol=BTC/USDT&timeframe=${timeframe}&limit=1`)
+            const pollJson = await pollRes.json()
+            if (cancelled) return
+            setMarketDataStatus(pollJson.market_data_status ?? null)
+            setFormingCandle(pollJson.forming_candle ?? null)
+            if (pollJson.forming_candle) {
+              series.update({
+                time: pollJson.forming_candle.time,
+                open: pollJson.forming_candle.open, high: pollJson.forming_candle.high,
+                low: pollJson.forming_candle.low, close: pollJson.forming_candle.close,
+                color: FORMING_CANDLE_COLOR, borderColor: FORMING_CANDLE_COLOR, wickColor: FORMING_CANDLE_COLOR,
+              })
             }
-          }, 10000)
-        }
+          } catch (e) {
+            console.error("Failed to poll live forming candle:", e)
+          }
+        }, 10000)
 
         return () => {
           window.removeEventListener("resize", handleResize)
@@ -191,12 +194,14 @@ export default function ChartPage() {
           <div ref={containerRef} style={{ display: error ? "none" : "block" }} />
         </div>
 
-        {timeframe === "4h" && !loading && !error && (
+        {!loading && !error && (
           formingCandle ? (
             <div className="dashboard-card mt-4 border border-[#eab308]/50">
               <div className="flex items-center gap-2 mb-2">
                 <span className="w-2 h-2 rounded-full bg-[#eab308] animate-pulse" />
-                <p className="text-xs font-mono font-semibold text-[#eab308]">LIVE FORMING 4H CANDLE (not yet closed)</p>
+                <p className="text-xs font-mono font-semibold text-[#eab308]">
+                  LIVE FORMING {timeframe.toUpperCase()} CANDLE (not yet closed)
+                </p>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
                 <div>
@@ -221,13 +226,16 @@ export default function ChartPage() {
                 </div>
               </div>
               <p className="text-xs text-muted-foreground mt-2">
-                {formingCandle.tick_count} live tick{formingCandle.tick_count === 1 ? "" : "s"} received this bar &middot; intrabar, not yet a confirmed closed-candle signal condition
+                {formingCandle.tick_count} live tick{formingCandle.tick_count === 1 ? "" : "s"} received this bar &middot;{" "}
+                {timeframe === "4h"
+                  ? "intrabar -- may be evaluated by the live breakout detector, not yet a confirmed closed-candle signal condition"
+                  : "display only -- the validated strategy only evaluates the 4h timeframe, no signals are generated from this bar"}
               </p>
             </div>
           ) : (
             <p className="text-muted-foreground text-xs mt-3">
               {marketDataStatus === "LIVE"
-                ? "Waiting for the first live tick of this 4h bar..."
+                ? `Waiting for the first live tick of this ${timeframe} bar...`
                 : "No forming-candle data -- live market data is not currently LIVE (see Dashboard for connection status)."}
             </p>
           )

@@ -25,17 +25,24 @@ supervisor's job is done and every subsequent drop/reconnect is handled
 entirely by CoinDCXMarketDataWebSocket's own existing (unmodified)
 python-socketio reconnection -- never re-entered by this supervisor.
 
-live_candle_aggregator (added for the Live Chart's forming-candle display,
+live_candle_aggregators (added for the Live Chart's forming-candle display,
 audited after real evidence showed the chart's latest bar could sit up to
 5h40m stale -- the dashboard price was already live via `market_ws`
-directly, but the chart never consumed it at all): a SINGLE, shared
-LiveCandleAggregator instance, timeframe-matched to the validated 4h
-strategy. Shared (not duplicated) between apps/api/routers/market.py's
-/candles endpoint (feeds it a tick on every request, for chart display)
-and services/scheduler/runner.py's live_breakout_job (feeds it a tick
-every 30s, for signal detection) -- both read/write the SAME forming-bar
-state, so the chart and the live signal path can never disagree about
-what "the current forming 4h candle" looks like.
+directly, but the chart never consumed it at all; later generalized from a
+single 4h-only instance after a follow-up audit required every supported
+timeframe, not just 4h, to have a correct live forming candle): a SINGLE,
+shared LiveCandleAggregator PER SUPPORTED TIMEFRAME (see
+SUPPORTED_LIVE_TIMEFRAMES below), keyed by timeframe string. Shared (not
+duplicated) between apps/api/routers/market.py's /candles endpoint (feeds
+the requested timeframe's aggregator a tick on every request, for chart
+display, for WHICHEVER timeframe the user is viewing) and
+services/scheduler/runner.py's live_breakout_job (feeds ONLY the "4h" entry
+a tick every 30s, for signal detection -- the validated strategy remains
+4h-only; the other timeframes' aggregators exist purely for chart/market-
+state display and are never read by the signal engine). Both call sites
+read/write the SAME `live_candle_aggregators["4h"]` object, so the chart
+and the live signal path can never disagree about what "the current
+forming 4h candle" looks like.
 """
 import asyncio
 from typing import Optional
@@ -76,10 +83,17 @@ async def _on_connection_transition(old_status: ConnectionState, new_status: Con
 
 market_ws = CoinDCXMarketDataWebSocket(on_state_change=_on_connection_transition)
 
-# Shared forming-candle state -- see module docstring. Fixed at 4h to
-# match the validated strategy timeframe; not per-chart-tab (15m/1h/1d
-# tabs keep showing only completed historical candles, unchanged).
-live_candle_aggregator = LiveCandleAggregator(timeframe="4h")
+# Every timeframe the chart/backfill pipeline supports (matches
+# services/market_data/ingestion.py: TIMEFRAMES) gets its own live forming-
+# candle aggregator -- see module docstring. The validated strategy stays
+# 4h-only (services/signal_engine/live_breakout.py is never pointed at any
+# other entry); the rest exist so the Live Chart can show a correct live
+# forming candle no matter which timeframe tab the user has open.
+SUPPORTED_LIVE_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+live_candle_aggregators: dict[str, LiveCandleAggregator] = {
+    tf: LiveCandleAggregator(timeframe=tf) for tf in SUPPORTED_LIVE_TIMEFRAMES
+}
 
 
 async def _default_wait_or_stop(stop_event: asyncio.Event, timeout: float) -> None:

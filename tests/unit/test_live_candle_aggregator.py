@@ -60,11 +60,26 @@ def test_unsupported_timeframe_raises_rather_than_guessing():
 
 
 @pytest.mark.parametrize("timeframe,ts,expected_open", [
+    ("1m", datetime(2026, 1, 1, 0, 0, 45), datetime(2026, 1, 1, 0, 0, 0)),
+    ("1m", datetime(2026, 1, 1, 10, 15, 59), datetime(2026, 1, 1, 10, 15, 0)),
+    ("5m", datetime(2026, 1, 1, 0, 7, 30), datetime(2026, 1, 1, 0, 5, 0)),
+    ("5m", datetime(2026, 1, 1, 10, 14, 59), datetime(2026, 1, 1, 10, 10, 0)),
     ("15m", datetime(2026, 1, 1, 0, 22, 0), datetime(2026, 1, 1, 0, 15, 0)),
     ("1h", datetime(2026, 1, 1, 5, 59, 59), datetime(2026, 1, 1, 5, 0, 0)),
+    ("4h", datetime(2026, 1, 1, 3, 59, 59), datetime(2026, 1, 1, 0, 0, 0)),
+    ("4h", datetime(2026, 1, 1, 4, 0, 0), datetime(2026, 1, 1, 4, 0, 0)),
     ("1d", datetime(2026, 1, 1, 23, 59, 0), datetime(2026, 1, 1, 0, 0, 0)),
 ])
 def test_bucket_alignment_across_timeframes(timeframe, ts, expected_open):
+    """Proves the exact candle boundary for EVERY supported timeframe
+    (1m/5m/15m/1h/4h/1d) -- e.g. 15m: 10:00-10:14:59 forming, 10:15 the
+    previous candle becomes completed; 4h: 00:00-03:59:59 forming, 04:00
+    the previous candle becomes completed."""
     agg = LiveCandleAggregator(timeframe=timeframe)
     candle = agg.on_tick(1.0, ts=ts)
     assert candle.open_time == expected_open
+
+
+def test_all_six_supported_timeframes_construct_without_error():
+    for tf in ("1m", "5m", "15m", "1h", "4h", "1d"):
+        LiveCandleAggregator(timeframe=tf)  # must not raise

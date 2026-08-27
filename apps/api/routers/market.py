@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database.schema import get_db
 from database.schema.models import Candle, ConnectionState, Signal
 from services.exchange.fx import get_usdt_inr_rate, convert_usdt_to_inr, conversion_meta
-from services.market_data.live_state import live_candle_aggregator, market_ws
+from services.market_data.live_state import live_candle_aggregators, market_ws
 
 router = APIRouter()
 
@@ -26,13 +26,6 @@ def _epoch_seconds(dt: datetime) -> int:
     fields as UTC directly, with no local-timezone conversion, which is
     what a Candle/Signal's naive UTC timestamp actually requires."""
     return calendar.timegm(dt.timetuple())
-
-# The shared live_candle_aggregator (services/market_data/live_state.py) is
-# fixed to 4h, matching the validated strategy timeframe -- other chart
-# tabs (15m/1h/1d) intentionally keep showing only completed historical
-# candles, unchanged, rather than maintaining four separate live
-# aggregators for tabs the strategy itself doesn't use.
-LIVE_FORMING_CANDLE_TIMEFRAME = "4h"
 
 
 @router.get("/candles")
@@ -63,22 +56,30 @@ async def get_candles(
     # not attempt to reconstruct one. conversion_status/timestamp/source
     # tell the frontend how fresh (and how approximate for older candles)
     # this is; frontend shows "INR conversion unavailable" if rate is None.
+    #
+    # Every timeframe the aggregator registry supports (1m/5m/15m/1h/4h/1d --
+    # see services/market_data/live_state.py) gets a correct live forming
+    # candle here, not just 4h: only the SIGNAL engine stays 4h-only
+    # (services/signal_engine/live_breakout.py is never pointed at any other
+    # entry in the registry), this display endpoint is timeframe-agnostic.
+    aggregator = live_candle_aggregators.get(timeframe)
     live_feed_is_live = market_ws.connection_status() == ConnectionState.LIVE and market_ws.state.last_price_usdt is not None
-    needs_rate = bool(rows) or (symbol == "BTC/USDT" and timeframe == LIVE_FORMING_CANDLE_TIMEFRAME and live_feed_is_live)
+    needs_rate = bool(rows) or (symbol == "BTC/USDT" and aggregator is not None and live_feed_is_live)
     rate = await get_usdt_inr_rate() if needs_rate else None
 
     # Live forming (not-yet-closed) candle -- fixes a real, measured gap:
     # the chart's "latest" bar was previously always the last COMPLETED
     # candle, which can sit up to a full timeframe period stale (measured
-    # up to 5h40m for 4h during audit). Only computed for the timeframe the
-    # shared aggregator actually tracks (4h) and only while the live feed
-    # is genuinely LIVE -- never guessed, never shown as live when it
-    # isn't. Feeding the tick here (not just reading `.current`) is what
-    # keeps the forming candle up to date on every chart poll even if the
-    # scheduler's own 30s live_breakout_job tick hasn't landed yet.
+    # up to 5h40m for 4h during audit). Only computed for a timeframe the
+    # registry actually tracks and only while the live feed is genuinely
+    # LIVE -- never guessed, never shown as live when it isn't. Feeding the
+    # tick here (not just reading `.current`) is what keeps the forming
+    # candle up to date on every chart poll even if the scheduler's own 30s
+    # live_breakout_job tick (which only ever touches the "4h" entry)
+    # hasn't landed yet.
     forming_candle = None
-    if symbol == "BTC/USDT" and timeframe == LIVE_FORMING_CANDLE_TIMEFRAME and live_feed_is_live:
-        candle = live_candle_aggregator.on_tick(market_ws.state.last_price_usdt, market_ws.state.received_at)
+    if symbol == "BTC/USDT" and aggregator is not None and live_feed_is_live:
+        candle = aggregator.on_tick(market_ws.state.last_price_usdt, market_ws.state.received_at)
         forming_candle = {
             "time": _epoch_seconds(candle.open_time),
             "open": candle.open, "high": candle.high, "low": candle.low, "close": candle.close,

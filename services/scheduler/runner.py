@@ -17,7 +17,7 @@ import structlog
 from database.schema import async_session
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
 from services.market_data.binance import BinanceExchange
-from services.market_data.live_state import market_ws, live_candle_aggregator
+from services.market_data.live_state import market_ws, live_candle_aggregators
 from services.scheduler.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from services.scheduler.jobs import (
     account_sync_job, exit_alert_job, signal_generation_job, outcome_evaluation_job, candle_ingestion_job,
@@ -47,12 +47,15 @@ class SchedulerRunner:
         self.outcome_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.candle_ingestion_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.live_breakout_breaker = CircuitBreaker(config=CircuitBreakerConfig())
-        # The SHARED, process-wide forming-candle aggregator (services/
-        # market_data/live_state.py) -- not a private instance -- so the
-        # Live Chart (apps/api/routers/market.py) and this scheduler's live
-        # signal detection always see the exact same forming-bar state,
-        # never two independently-drifting copies.
-        self._live_candle_aggregator = live_candle_aggregator
+        # The SHARED, process-wide 4h forming-candle aggregator (services/
+        # market_data/live_state.py's registry -- not a private instance)
+        # -- so the Live Chart (apps/api/routers/market.py) and this
+        # scheduler's live signal detection always see the exact same
+        # forming-bar state, never two independently-drifting copies. The
+        # validated strategy is 4h-only, so only that one entry is ever
+        # read here; the registry's other timeframes exist purely for
+        # chart/market-state display.
+        self._live_candle_aggregator = live_candle_aggregators["4h"]
 
     def _make_provider(self) -> CoinDCXReadOnlyAccountProvider:
         return CoinDCXReadOnlyAccountProvider(self._api_key, self._api_secret)

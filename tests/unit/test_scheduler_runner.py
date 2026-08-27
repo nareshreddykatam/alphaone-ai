@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from database.schema import Base
+from services.market_data.live_state import live_candle_aggregators
 from services.scheduler.circuit_breaker import CircuitState
 from services.scheduler.runner import SchedulerRunner
 
@@ -259,3 +260,13 @@ async def test_live_breakout_uses_a_persistent_aggregator_shared_across_ticks(pa
     await runner.run_once_live_breakout()
     assert seen_aggregators[0] is seen_aggregators[1]
     assert seen_aggregators[0] is runner._live_candle_aggregator
+
+
+def test_live_breakout_aggregator_is_specifically_the_4h_registry_entry():
+    """The scheduler's live-signal detection stays 4h-only even though the
+    live_state registry now holds an aggregator per supported timeframe
+    (1m/5m/15m/1h/4h/1d) -- the validated strategy must never silently pick
+    up a different timeframe's forming candle."""
+    runner = SchedulerRunner()
+    assert runner._live_candle_aggregator is live_candle_aggregators["4h"]
+    assert runner._live_candle_aggregator is not live_candle_aggregators["1h"]

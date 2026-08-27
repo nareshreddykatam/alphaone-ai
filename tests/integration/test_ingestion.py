@@ -201,3 +201,141 @@ async def test_a_failing_exchange_call_propagates_rather_than_looking_like_empty
     svc = DataIngestionService(exchange, db_session)
     with pytest.raises(ConnectionError):
         await svc.fetch_and_store_candles("BTC/USDT", "1m", since=datetime(2024, 1, 1))
+
+
+# ---- Incomplete (still-forming) candle rejection, generic across every
+# supported timeframe -- see services/market_data/ingestion.py's
+# _backfill_range docstring. A real bug found during the live-price audit:
+# ccxt/Binance can return the currently-in-progress candle as the last page
+# entry once the requested window reaches "now"; that candle must never be
+# persisted as if it were a completed historical bar. ----
+
+class _FixedCandlesExchange(ExchangeBase):
+    """Returns exactly the candles it was constructed with (never an
+    infinite generator), filtered by `since` -- lets a test control
+    precisely which candles (complete and/or still-forming) the "exchange"
+    hands back for a given backfill() call."""
+
+    def __init__(self, candles: list[OHLCV]):
+        self._candles = candles
+
+    async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=1000):
+        cs = [c for c in self._candles if since is None or c.timestamp >= since]
+        return cs[:limit]
+
+    async def fetch_funding_rate(self, symbol):
+        raise NotImplementedError
+
+    async def fetch_funding_rate_history(self, symbol, since=None, limit=1000):
+        return []
+
+    async def fetch_open_interest(self, symbol):
+        raise NotImplementedError
+
+    async def fetch_open_interest_history(self, symbol, timeframe="1h", since=None, limit=500):
+        return []
+
+    async def fetch_liquidations(self, symbol, limit=100):
+        return []
+
+    async def fetch_order_book(self, symbol, limit=20):
+        raise NotImplementedError
+
+    async def fetch_ticker(self, symbol):
+        raise NotImplementedError
+
+    async def close(self):
+        pass
+
+
+class _FrozenClock(datetime):
+    """A real datetime subclass (so type hints/arithmetic in ingestion.py
+    keep working unmodified) whose .utcnow() returns a controllable,
+    class-level value -- lets a test simulate time passing (a still-
+    forming candle's bucket actually closing) deterministically, without a
+    real sleep."""
+    _now = datetime(2024, 1, 1)
+
+    @classmethod
+    def utcnow(cls):
+        return cls._now
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"])
+async def test_incomplete_current_candle_is_not_stored_as_completed(db_session, monkeypatch, timeframe):
+    interval = TIMEFRAME_TO_TIMEDELTA[timeframe]
+    frozen_now = datetime(2024, 6, 1, 12, 0, 0)
+    monkeypatch.setattr(_FrozenClock, "_now", frozen_now)
+    monkeypatch.setattr("services.market_data.ingestion.datetime", _FrozenClock)
+
+    def _mk(ts):
+        return OHLCV(timestamp=ts, open=1, high=2, low=0.5, close=1.5, volume=10, timeframe=timeframe, symbol="BTC/USDT")
+
+    complete = [_mk(frozen_now - interval * n) for n in (3, 2, 1)]
+    forming = _mk(frozen_now)  # close time == frozen_now + interval, strictly after "now" -- not yet closed
+
+    exchange = _FixedCandlesExchange(complete + [forming])
+    svc = DataIngestionService(exchange, db_session)
+    stored = await svc.backfill("BTC/USDT", timeframe, frozen_now - interval * 10, frozen_now, page_limit=1000)
+
+    assert stored == 3, "only the 3 already-closed candles should be stored"
+    saved = await svc.get_stored_candles("BTC/USDT", timeframe)
+    saved_timestamps = {c.timestamp for c in saved}
+    assert forming.timestamp not in saved_timestamps, "the still-forming candle must never be persisted as completed"
+    assert {c.timestamp for c in complete} <= saved_timestamps
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"])
+async def test_previously_incomplete_candle_is_stored_once_its_bucket_actually_closes(db_session, monkeypatch, timeframe):
+    """The candle skipped as "still forming" on one backfill() call must be
+    picked up and stored on a LATER call once real time has actually
+    advanced past its close boundary -- proving `since` is never advanced
+    past an incomplete candle (which would silently skip it forever)."""
+    interval = TIMEFRAME_TO_TIMEDELTA[timeframe]
+    frozen_now = datetime(2024, 6, 1, 12, 0, 0)
+    monkeypatch.setattr(_FrozenClock, "_now", frozen_now)
+    monkeypatch.setattr("services.market_data.ingestion.datetime", _FrozenClock)
+
+    def _mk(ts):
+        return OHLCV(timestamp=ts, open=1, high=2, low=0.5, close=1.5, volume=10, timeframe=timeframe, symbol="BTC/USDT")
+
+    forming_then = _mk(frozen_now)
+    exchange = _FixedCandlesExchange([forming_then])
+    svc = DataIngestionService(exchange, db_session)
+
+    first = await svc.backfill("BTC/USDT", timeframe, frozen_now - interval, frozen_now, page_limit=1000)
+    assert first == 0
+
+    # Real time advances past the candle's close boundary.
+    later = frozen_now + interval
+    monkeypatch.setattr(_FrozenClock, "_now", later)
+    exchange2 = _FixedCandlesExchange([forming_then])
+    svc2 = DataIngestionService(exchange2, db_session)
+    second = await svc2.backfill("BTC/USDT", timeframe, frozen_now - interval, later, page_limit=1000)
+
+    assert second == 1, "the candle must be re-fetched and stored now that it has actually closed"
+    saved = await svc2.get_stored_candles("BTC/USDT", timeframe)
+    assert forming_then.timestamp in {c.timestamp for c in saved}
+
+
+@pytest.mark.asyncio
+async def test_fully_historical_backfill_is_unaffected_by_the_completeness_filter(db_session, monkeypatch):
+    """When range_end is already fully in the past, every returned candle's
+    bucket has necessarily already closed -- the completeness filter must
+    be a complete no-op there, dropping nothing."""
+    frozen_now = datetime(2026, 1, 1)
+    monkeypatch.setattr(_FrozenClock, "_now", frozen_now)
+    monkeypatch.setattr("services.market_data.ingestion.datetime", _FrozenClock)
+
+    start = datetime(2024, 1, 1)
+    candles = [
+        OHLCV(timestamp=start + timedelta(minutes=i), open=1, high=2, low=0.5, close=1.5,
+              volume=10, timeframe="1m", symbol="BTC/USDT")
+        for i in range(10)
+    ]
+    exchange = _FixedCandlesExchange(candles)
+    svc = DataIngestionService(exchange, db_session)
+    stored = await svc.backfill("BTC/USDT", "1m", start, start + timedelta(minutes=9), page_limit=1000)
+    assert stored == 10  # every historical candle stored, none dropped as "incomplete"

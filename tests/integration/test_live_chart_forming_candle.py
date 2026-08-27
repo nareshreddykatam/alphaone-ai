@@ -14,21 +14,23 @@ from apps.api.main import app
 from apps.api.config import get_settings
 from database.schema import Base, get_db
 from database.schema.models import Candle, ConnectionState
-from services.market_data.live_state import market_ws, live_candle_aggregator
+from services.market_data.live_state import market_ws, live_candle_aggregators
 
 
 @pytest.fixture(autouse=True)
 def _reset_shared_live_state():
-    """market_ws and live_candle_aggregator are both process-wide
-    singletons shared with every other test file -- reset before and
-    after every test here so nothing leaks in either direction."""
+    """market_ws and every entry in the live_candle_aggregators registry
+    (one per supported timeframe) are process-wide singletons shared with
+    every other test file -- reset before and after every test here so
+    nothing leaks in either direction."""
     def _reset():
         market_ws.state.last_price_usdt = None
         market_ws.state.mark_price_usdt = None
         market_ws.state.received_at = None
         market_ws._connected = False
         market_ws._ever_connected = False
-        live_candle_aggregator.current = None
+        for agg in live_candle_aggregators.values():
+            agg.current = None
 
     _reset()
     yield
@@ -125,15 +127,61 @@ async def test_forming_candle_reflects_high_low_across_repeated_ticks(client):
 
 
 @pytest.mark.asyncio
-async def test_forming_candle_only_computed_for_the_4h_timeframe(client):
-    """Other chart tabs (15m/1h/1d) keep showing only historical data --
-    the shared aggregator is fixed to 4h, matching the validated strategy,
-    not duplicated per tab."""
+@pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "1h", "4h", "1d"])
+async def test_forming_candle_computed_for_every_supported_timeframe(client, timeframe):
+    """Every timeframe the live_candle_aggregators registry supports gets a
+    correct live forming candle, not just 4h -- only the SIGNAL engine
+    stays 4h-only; this display endpoint is timeframe-agnostic."""
     ac, session_maker = client
     _make_live(price=79700.0)
-    resp = await ac.get("/api/v1/market/candles", params={"symbol": "BTC/USDT", "timeframe": "15m"})
+    resp = await ac.get("/api/v1/market/candles", params={"symbol": "BTC/USDT", "timeframe": timeframe})
+    body = resp.json()
+    assert body["forming_candle"] is not None
+    assert body["forming_candle"]["close"] == 79700.0
+
+
+@pytest.mark.asyncio
+async def test_forming_candle_is_null_for_an_unsupported_timeframe(client):
+    """A timeframe outside the registry (e.g. "1w", never backfilled/traded
+    by this platform) must never fabricate a forming candle."""
+    ac, session_maker = client
+    _make_live(price=79700.0)
+    resp = await ac.get("/api/v1/market/candles", params={"symbol": "BTC/USDT", "timeframe": "1w"})
     body = resp.json()
     assert body["forming_candle"] is None
+
+
+@pytest.mark.asyncio
+async def test_different_timeframes_forming_candles_are_independent(client):
+    """A 15m tick and a 1h tick landing at the same wall-clock moment
+    produce each timeframe's own correctly-bucketed forming candle -- never
+    one timeframe's state leaking into another's. `received_at` must be
+    real-time-fresh (market_ws.connection_status()'s 20s staleness window),
+    so the expected bucket boundaries are computed the same way
+    LiveCandleAggregator itself computes them, rather than asserted via a
+    hardcoded (and potentially stale-by-then) timestamp."""
+    from services.signal_engine.live_breakout import LiveCandleAggregator
+
+    ac, session_maker = client
+    now = datetime.utcnow()
+    _make_live(price=79700.0, received_at=now)
+
+    resp_15m = await ac.get("/api/v1/market/candles", params={"symbol": "BTC/USDT", "timeframe": "15m"})
+    resp_1h = await ac.get("/api/v1/market/candles", params={"symbol": "BTC/USDT", "timeframe": "1h"})
+
+    body_15m = resp_15m.json()
+    body_1h = resp_1h.json()
+    assert body_15m["forming_candle"] is not None
+    assert body_1h["forming_candle"] is not None
+
+    expected_15m_open = LiveCandleAggregator(timeframe="15m")._bucket_start(now)
+    expected_1h_open = LiveCandleAggregator(timeframe="1h")._bucket_start(now)
+    if expected_15m_open == expected_1h_open:
+        # Only possible exactly at the top of the hour -- still a correct,
+        # meaningful assertion rather than a coincidence to hide.
+        assert body_15m["forming_candle"]["time"] == body_1h["forming_candle"]["time"]
+    else:
+        assert body_15m["forming_candle"]["time"] != body_1h["forming_candle"]["time"]
 
 
 @pytest.mark.asyncio
