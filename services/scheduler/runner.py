@@ -16,8 +16,11 @@ import structlog
 
 from database.schema import async_session
 from services.exchange.coindcx import CoinDCXReadOnlyAccountProvider
+from services.market_data.binance import BinanceExchange
 from services.scheduler.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
-from services.scheduler.jobs import account_sync_job, exit_alert_job, signal_generation_job, outcome_evaluation_job
+from services.scheduler.jobs import (
+    account_sync_job, exit_alert_job, signal_generation_job, outcome_evaluation_job, candle_ingestion_job,
+)
 
 logger = structlog.get_logger()
 
@@ -25,6 +28,7 @@ ACCOUNT_SYNC_INTERVAL_SECONDS = 30
 EXIT_ALERT_INTERVAL_SECONDS = 30
 SIGNAL_GENERATION_INTERVAL_SECONDS = 900  # 15 min -- primary strategy is 4h, no value in checking more often
 OUTCOME_EVALUATION_INTERVAL_SECONDS = 900
+CANDLE_INGESTION_INTERVAL_SECONDS = 900  # 15 min -- see services/scheduler/jobs.py's module docstring for the reasoning
 
 
 class SchedulerRunner:
@@ -38,9 +42,17 @@ class SchedulerRunner:
         self.exit_alert_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.signal_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.outcome_breaker = CircuitBreaker(config=CircuitBreakerConfig())
+        self.candle_ingestion_breaker = CircuitBreaker(config=CircuitBreakerConfig())
 
     def _make_provider(self) -> CoinDCXReadOnlyAccountProvider:
         return CoinDCXReadOnlyAccountProvider(self._api_key, self._api_secret)
+
+    def _make_binance_exchange(self) -> BinanceExchange:
+        # Public OHLCV data only -- no credentials, mirrors the exact
+        # construction scripts/_common.py: new_exchange() already uses for
+        # the manual backfill script. Never used for CoinDCX account/order
+        # access, which is entirely separate (_make_provider above).
+        return BinanceExchange(api_key="", api_secret="", testnet=False)
 
     async def run_once_account_sync(self) -> None:
         if not self.account_sync_breaker.can_attempt():
@@ -96,6 +108,22 @@ class SchedulerRunner:
             self.outcome_breaker.record_failure()
             logger.error("outcome_evaluation_job failed", error=str(e))
 
+    async def run_once_candle_ingestion(self) -> None:
+        if not self.candle_ingestion_breaker.can_attempt():
+            logger.warning("candle_ingestion_job skipped -- circuit open")
+            return
+        exchange = self._make_binance_exchange()
+        try:
+            async with async_session() as session:
+                stored = await candle_ingestion_job(session, exchange)
+            self.candle_ingestion_breaker.record_success()
+            logger.info("candle_ingestion_job succeeded", stored=stored)
+        except Exception as e:
+            self.candle_ingestion_breaker.record_failure()
+            logger.error("candle_ingestion_job failed", error=str(e))
+        finally:
+            await exchange.close()
+
     async def _loop(self, tick_fn, interval_seconds: float) -> None:
         while self._running:
             await tick_fn()
@@ -110,6 +138,7 @@ class SchedulerRunner:
             asyncio.create_task(self._loop(self.run_once_exit_alerts, EXIT_ALERT_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop(self.run_once_signal_generation, SIGNAL_GENERATION_INTERVAL_SECONDS)),
             asyncio.create_task(self._loop(self.run_once_outcome_evaluation, OUTCOME_EVALUATION_INTERVAL_SECONDS)),
+            asyncio.create_task(self._loop(self.run_once_candle_ingestion, CANDLE_INGESTION_INTERVAL_SECONDS)),
         ]
         logger.info("Scheduler started", jobs=len(self._tasks))
 
