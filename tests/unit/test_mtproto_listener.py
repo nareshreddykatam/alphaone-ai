@@ -14,8 +14,29 @@ import pytest
 from services.telegram_mtproto.client import MTProtoListener, _client_configured, build_client
 
 
-def test_not_configured_by_default():
+def test_not_configured_without_all_four_settings(monkeypatch):
+    """Exercises _client_configured()'s own logic explicitly, rather than
+    relying on this machine's real .env happening to be empty -- a real
+    local dev environment may legitimately have real MTProto credentials
+    configured (e.g. for manual verification), which must never make this
+    test flaky or falsely fail."""
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "telegram_mtproto_enabled", False)
+    monkeypatch.setattr(settings, "telegram_api_id", "")
+    monkeypatch.setattr(settings, "telegram_api_hash", "")
+    monkeypatch.setattr(settings, "telegram_session", "")
     assert _client_configured() is False
+
+
+def test_configured_when_all_four_settings_are_present(monkeypatch):
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "telegram_mtproto_enabled", True)
+    monkeypatch.setattr(settings, "telegram_api_id", "12345")
+    monkeypatch.setattr(settings, "telegram_api_hash", "fakehash")
+    monkeypatch.setattr(settings, "telegram_session", "fakesession")
+    assert _client_configured() is True
 
 
 def test_build_client_raises_clear_error_without_full_config(monkeypatch):
