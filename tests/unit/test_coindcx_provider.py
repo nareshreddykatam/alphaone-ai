@@ -58,7 +58,7 @@ async def test_get_ticker_extracts_by_normalized_symbol():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
             "ts": 1720429586580, "vs": 1,
-            "prices": {"B-BTC_INR": {"mp": 65000.5, "ls": 64990.0, "h": 66000, "l": 64000}},
+            "prices": {"B-BTC_USDT": {"mp": 65000.5, "ls": 64990.0, "h": 66000, "l": 64000}},
         })
 
     provider, client = _market_provider(handler)

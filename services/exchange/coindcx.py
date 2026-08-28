@@ -109,8 +109,14 @@ class CoinDCXMarketDataProvider(ExchangeMarketDataProvider):
 
     async def get_ticker(self, symbol: str) -> dict:
         """Uses the real-time current-prices endpoint (recommended by
-        CoinDCX's own docs over REST candles for anything time-sensitive)."""
-        instrument = normalize_symbol(symbol)
+        CoinDCX's own docs over REST candles for anything time-sensitive).
+        Unlike account-data calls, this looks up a specific public market
+        pair, so the instrument's margin currency must come from the
+        symbol's own quote (e.g. "BTC/USDT" -> "USDT"), not
+        DEFAULT_MARGIN_CURRENCY -- that default reflects the connected
+        account's INR wallet and is irrelevant to which market is being
+        priced."""
+        instrument = normalize_symbol(symbol, margin_currency=symbol.split("/")[1])
         resp = await self._client.get(f"{COINDCX_PUBLIC_BASE}/market_data/v3/current_prices/futures/rt")
         resp.raise_for_status()
         data = resp.json()
