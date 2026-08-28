@@ -333,6 +333,37 @@ class CoinDCXReadOnlyAccountProvider(ExchangeAccountProvider):
             return []
         return resp.json()
 
+    async def get_futures_conversion_rate(self, margin_currency: str = "INR") -> Optional[dict]:
+        """The authoritative USDT/INR rate CoinDCX itself notionally uses
+        to convert INR-margined futures wallets to/from USDT ("Get
+        Conversion Price", POST /api/v1/derivatives/futures/data/conversions
+        -- note this is a DIFFERENT base path, /api/v1/ not /exchange/v1/,
+        confirmed against the real official docs). Distinct from
+        services/exchange/fx.py's public USDT/INR SPOT ticker, which that
+        module's own docstring explicitly disclaims as "for display
+        purposes only -- never for account math": this is CoinDCX's own
+        internal futures conversion rate, the correct source for sizing a
+        real-money margin trade on an INR-margined account. Returns None
+        -- never a fabricated rate -- if unavailable or not configured."""
+        if not self.is_configured:
+            return None
+        try:
+            resp = await self._post("/api/v1/derivatives/futures/data/conversions", {})
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning("CoinDCX get_futures_conversion_rate failed", error=str(e))
+            return None
+        rows = resp.json()
+        row = next((r for r in rows if r.get("margin_currency_short_name") == margin_currency), None)
+        if row is None or row.get("conversion_price") is None:
+            return None
+        return {
+            "rate": float(row["conversion_price"]),
+            "margin_currency": row.get("margin_currency_short_name"),
+            "target_currency": row.get("target_currency_short_name"),
+            "last_updated_at": row.get("last_updated_at"),
+        }
+
     async def get_orders(self, status: str = "open,filled,cancelled") -> list[dict]:
         """Read-only "List Orders". CoinDCX requires `side` as a mandatory
         single value (buy OR sell) -- there is no documented "both" option,

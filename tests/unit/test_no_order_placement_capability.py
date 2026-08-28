@@ -337,7 +337,14 @@ def test_order_client_submit_futures_order_always_raises_and_never_makes_a_netwo
 def test_live_execution_gates_module_never_imports_a_real_order_client():
     import services.live_execution.gates as gates_module
     source = inspect.getsource(gates_module)
-    assert "services.exchange.coindcx" not in source
+    # Precise module-boundary check -- gates.py legitimately imports the
+    # separate, read-only services.exchange.coindcx_instruments module
+    # (Contract Audit V2), which shares "services.exchange.coindcx" as a
+    # string PREFIX; a loose substring check would false-positive on that
+    # safe import, so this checks the exact mutating-capable module path.
+    assert "services.exchange.coindcx import" not in source
+    assert "services.exchange.coindcx " not in source
+    assert "CoinDCXReadOnlyAccountProvider" not in source
     assert "submit_futures_order" not in source
 
 
@@ -368,6 +375,89 @@ def test_live_execution_executor_only_place_that_imports_the_order_client():
         source = inspect.getsource(module)
         assert "submit_futures_order" not in source
         assert "services.live_execution.order_client" not in source
+
+
+def test_contract_audit_v2_modules_expose_no_order_mutating_function_or_method():
+    """Contract Audit V2: every new module built for the audit (instrument
+    metadata, sizing, timestamp safety, the inert wiring hook) must pass
+    the exact same forbidden-substring scan. services/live_execution/
+    order_contract.py is DELIBERATELY excluded here -- its functions are
+    intentionally named after the real mutating endpoints they document
+    (build_create_order_request, build_update_leverage_request) and are
+    covered by the dedicated tests below instead (never sends a request;
+    never imported by gates.py, executor.py, or order_client.py)."""
+    import services.exchange.coindcx_instruments as instruments_module
+    import services.live_execution.sizing as sizing_module
+    import services.live_execution.timestamp_safety as timestamp_module
+    import services.live_execution.wiring as wiring_module
+
+    modules = [instruments_module, sizing_module, timestamp_module, wiring_module]
+    for module in modules:
+        function_names = [
+            name for name, obj in inspect.getmembers(module, predicate=inspect.isfunction)
+            if not name.startswith("_") and obj.__module__ == module.__name__
+        ]
+        for name in function_names:
+            lowered = name.lower()
+            for forbidden in FORBIDDEN_SUBSTRINGS:
+                assert forbidden not in lowered, f"{module.__name__}.{name} looks like an order-mutating function"
+
+
+def test_order_contract_builders_never_send_a_request():
+    """The builder functions produce dicts only -- no httpx/requests import
+    or call anywhere in the module, confirming they are pure, side-effect-
+    free payload construction, never wired to a real network call."""
+    import services.live_execution.order_contract as order_contract_module
+    source = inspect.getsource(order_contract_module)
+    for forbidden in ("httpx", "requests.", "aiohttp", ".post(", ".request("):
+        assert forbidden not in source
+
+
+def test_order_contract_module_is_never_imported_by_anything_that_could_send_a_request():
+    """The builder module's functions are deliberately named after real
+    mutating endpoints (build_create_order_request etc.) -- safety here
+    comes from it being imported ONLY by tests, never by gates.py,
+    executor.py, order_client.py, or wiring.py."""
+    import services.live_execution.gates as gates_module
+    import services.live_execution.executor as executor_module
+    import services.live_execution.order_client as order_client_module
+    import services.live_execution.wiring as wiring_module
+
+    for module in (gates_module, executor_module, order_client_module, wiring_module):
+        source = inspect.getsource(module)
+        assert "order_contract" not in source, f"{module.__name__} must never import services.live_execution.order_contract"
+
+
+def test_coindcx_instruments_module_only_ever_calls_get():
+    """Instrument metadata is genuinely public/read-only -- confirms no
+    POST call or authentication-header construction exists in this
+    module's actual code (the module docstring itself mentions
+    "X-AUTH-APIKEY" in prose, explaining why auth is NOT needed here --
+    so this checks for an actual header assignment, not the bare
+    substring, to avoid a docstring false-positive)."""
+    import services.exchange.coindcx_instruments as instruments_module
+    source = inspect.getsource(instruments_module)
+    assert "client.post(" not in source
+    assert '"X-AUTH' not in source
+    assert "'X-AUTH" not in source
+
+
+def test_wiring_module_checks_the_kill_switch_before_any_other_action():
+    """Contract Audit V2, Phase 11's belt-and-suspenders requirement:
+    the AUTOMATIC_TRADING_ENABLED check must be the very first statement
+    inside maybe_attempt_live_execution's body, before any import beyond
+    the module's own top-level ones, before any DB/network call."""
+    import services.live_execution.wiring as wiring_module
+    source = inspect.getsource(wiring_module.maybe_attempt_live_execution)
+    guard_idx = source.index("if not settings.automatic_trading_enabled")
+    first_heavy_import_idx = source.index("from services.exchange.coindcx import")
+    assert guard_idx < first_heavy_import_idx
+
+
+def test_wiring_module_never_imports_a_real_order_client():
+    import services.live_execution.wiring as wiring_module
+    source = inspect.getsource(wiring_module)
+    assert "submit_futures_order" not in source
 
 
 def test_live_breakout_job_and_evaluator_are_read_only_by_name():

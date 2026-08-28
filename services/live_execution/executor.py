@@ -37,6 +37,8 @@ async def process_live_execution_candidate(
     coindcx_account_healthy: bool,
     daily_loss_ok: bool,
     daily_loss_reason: str,
+    reconciliation_ok: bool,
+    reconciliation_reason: str,
 ) -> LiveExecution:
     """Idempotent: calling this twice for the objectively same signal
     (same computed idempotency key) returns the SAME row both times,
@@ -72,7 +74,7 @@ async def process_live_execution_candidate(
 
     gate_report = await check_all_live_execution_gates(
         session, candidate, usdt_inr_rate, market_data_healthy, coindcx_account_healthy,
-        daily_loss_ok, daily_loss_reason,
+        daily_loss_ok, daily_loss_reason, reconciliation_ok, reconciliation_reason,
     )
     execution.gate_results = gate_report.as_dict()
 

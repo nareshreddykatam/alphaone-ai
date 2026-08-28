@@ -11,9 +11,19 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from database.schema import Base
 from database.schema.models import LiveExecution, LiveExecutionStatus
+from services.exchange.coindcx_instruments import InstrumentMetadata
 from services.live_execution.executor import process_live_execution_candidate, get_existing_execution
 from services.live_execution.gates import LiveExecutionCandidate
 from services.live_execution.idempotency import compute_idempotency_key
+
+_HEALTHY_INSTRUMENT = InstrumentMetadata(
+    pair="B-BTC_USDT", status="active", kind="perpetual",
+    settle_currency_short_name="USDT", quote_currency_short_name="USDT",
+    position_currency_short_name="BTC", underlying_currency_short_name="BTC", margin_currency_short_name="USDT",
+    max_leverage_long=20.0, max_leverage_short=20.0, price_increment=0.01, quantity_increment=0.00000001,
+    min_trade_size=0.00000001, min_price=0.01, max_price=10_000_000.0, min_quantity=0.00000001, max_quantity=950.0,
+    min_notional=0.01, max_notional=0.0, exit_only=False, order_types=[], time_in_force_options=[], fetched_at=0.0,
+)
 
 
 @pytest.fixture
@@ -31,13 +41,17 @@ def _candidate(**overrides):
         entry_price=80000.0, stop_loss=79000.0, take_profit_1=83000.0,
         signal_timestamp=datetime.utcnow(), signal_id="SIG-1",
         instrument="B-BTC_USDT", instrument_eligible=True, instrument_eligibility_reason="OK",
+        current_market_price=80100.0, instrument_metadata=_HEALTHY_INSTRUMENT,
     )
     defaults.update(overrides)
     return LiveExecutionCandidate(**defaults)
 
 
 async def _process(session, candidate, **kw):
-    defaults = dict(usdt_inr_rate=88.0, market_data_healthy=True, coindcx_account_healthy=True, daily_loss_ok=True, daily_loss_reason="OK")
+    defaults = dict(
+        usdt_inr_rate=88.0, market_data_healthy=True, coindcx_account_healthy=True,
+        daily_loss_ok=True, daily_loss_reason="OK", reconciliation_ok=True, reconciliation_reason="OK",
+    )
     defaults.update(kw)
     return await process_live_execution_candidate(session, candidate, **defaults)
 

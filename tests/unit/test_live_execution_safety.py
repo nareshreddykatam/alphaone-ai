@@ -29,9 +29,19 @@ from unittest.mock import MagicMock
 
 from database.schema import Base
 from database.schema.models import LiveExecution, LiveExecutionStatus
+from services.exchange.coindcx_instruments import InstrumentMetadata
 from services.live_execution.executor import process_live_execution_candidate
 from services.live_execution.gates import LiveExecutionCandidate
 from services.live_execution.kill_switch import activate_emergency_stop
+
+_HEALTHY_INSTRUMENT = InstrumentMetadata(
+    pair="B-BTC_USDT", status="active", kind="perpetual",
+    settle_currency_short_name="USDT", quote_currency_short_name="USDT",
+    position_currency_short_name="BTC", underlying_currency_short_name="BTC", margin_currency_short_name="USDT",
+    max_leverage_long=20.0, max_leverage_short=20.0, price_increment=0.01, quantity_increment=0.00000001,
+    min_trade_size=0.00000001, min_price=0.01, max_price=10_000_000.0, min_quantity=0.00000001, max_quantity=950.0,
+    min_notional=0.01, max_notional=0.0, exit_only=False, order_types=[], time_in_force_options=[], fetched_at=0.0,
+)
 
 NEVER_REACHED_STATUSES = (
     LiveExecutionStatus.EXCHANGE_ACCEPTED.value,
@@ -71,13 +81,17 @@ def _healthy_candidate(**overrides):
         entry_price=80000.0, stop_loss=79000.0, take_profit_1=83000.0,
         signal_timestamp=datetime.utcnow(), signal_id="SIG-SAFETY-1",
         instrument="B-BTC_USDT", instrument_eligible=True, instrument_eligibility_reason="OK",
+        current_market_price=80100.0, instrument_metadata=_HEALTHY_INSTRUMENT,
     )
     defaults.update(overrides)
     return LiveExecutionCandidate(**defaults)
 
 
 async def _run(session, candidate, **kw):
-    defaults = dict(usdt_inr_rate=88.0, market_data_healthy=True, coindcx_account_healthy=True, daily_loss_ok=True, daily_loss_reason="OK")
+    defaults = dict(
+        usdt_inr_rate=88.0, market_data_healthy=True, coindcx_account_healthy=True,
+        daily_loss_ok=True, daily_loss_reason="OK", reconciliation_ok=True, reconciliation_reason="OK",
+    )
     defaults.update(kw)
     return await process_live_execution_candidate(session, candidate, **defaults)
 
@@ -356,3 +370,84 @@ async def test_telegram_sourced_candidate_means_zero_real_order_calls(session_ma
         candidate = _healthy_candidate(source="TELEGRAM_EXTERNAL", signal_id="SIG-SAFETY-18")
         execution = await _run(session, candidate)
         _assert_no_real_order(execution, order_mock)
+
+
+# 19. Entry deviation too large (real-time price has moved away from the signal)
+async def test_entry_price_deviation_means_zero_real_order_calls(session_maker, order_mock, monkeypatch):
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "automatic_trading_enabled", True)
+    monkeypatch.setattr(settings, "live_execution_armed", True)
+
+    async with session_maker() as session:
+        candidate = _healthy_candidate(entry_price=80000.0, current_market_price=85000.0, signal_id="SIG-SAFETY-19")
+        execution = await _run(session, candidate)
+        _assert_no_real_order(execution, order_mock)
+        assert execution.gate_results["ENTRY_DEVIATION_OK"]["passed"] is False
+
+
+# 20. No instrument metadata -- cannot precision-size the quantity
+async def test_no_instrument_metadata_means_zero_real_order_calls(session_maker, order_mock, monkeypatch):
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "automatic_trading_enabled", True)
+    monkeypatch.setattr(settings, "live_execution_armed", True)
+
+    async with session_maker() as session:
+        candidate = _healthy_candidate(instrument_metadata=None, signal_id="SIG-SAFETY-20")
+        execution = await _run(session, candidate)
+        _assert_no_real_order(execution, order_mock)
+        assert execution.gate_results["QUANTITY_VALID"]["passed"] is False
+
+
+# 21. Instrument max leverage below the required 10x (e.g. a real
+# SOL/USDT-shaped instrument capped at 5x)
+async def test_instrument_leverage_cap_below_10x_means_zero_real_order_calls(session_maker, order_mock, monkeypatch):
+    from dataclasses import replace
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "automatic_trading_enabled", True)
+    monkeypatch.setattr(settings, "live_execution_armed", True)
+
+    async with session_maker() as session:
+        low_leverage_instrument = replace(_HEALTHY_INSTRUMENT, max_leverage_long=5.0, max_leverage_short=5.0)
+        candidate = _healthy_candidate(instrument_metadata=low_leverage_instrument, signal_id="SIG-SAFETY-21")
+        execution = await _run(session, candidate)
+        _assert_no_real_order(execution, order_mock)
+        assert execution.gate_results["QUANTITY_VALID"]["passed"] is False
+
+
+# 22. Conflicting open position on the same symbol
+async def test_conflicting_same_symbol_position_means_zero_real_order_calls(session_maker, order_mock, monkeypatch):
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "automatic_trading_enabled", True)
+    monkeypatch.setattr(settings, "live_execution_armed", True)
+    monkeypatch.setattr(settings, "max_open_positions_live", 5)  # isolate NO_CONFLICTING_POSITION from POSITION_LIMIT_OK
+
+    async with session_maker() as session:
+        session.add(LiveExecution(
+            idempotency_key="existing-btc-safety-22", source="ALPHAONE_STRATEGY", symbol="BTC/USDT",
+            direction="LONG", status=LiveExecutionStatus.POSITION_OPEN.value,
+        ))
+        await session.commit()
+        candidate = _healthy_candidate(symbol="BTC/USDT", signal_id="SIG-SAFETY-22")
+        execution = await _run(session, candidate)
+        _assert_no_real_order(execution, order_mock)
+        assert execution.gate_results["NO_CONFLICTING_POSITION"]["passed"] is False
+
+
+# 23. Reconciliation never run / found discrepancies -- fail closed
+async def test_reconciliation_not_ok_means_zero_real_order_calls(session_maker, order_mock, monkeypatch):
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "automatic_trading_enabled", True)
+    monkeypatch.setattr(settings, "live_execution_armed", True)
+
+    async with session_maker() as session:
+        execution = await _run(
+            session, _healthy_candidate(signal_id="SIG-SAFETY-23"),
+            reconciliation_ok=False, reconciliation_reason="Position reconciliation has never run.",
+        )
+        _assert_no_real_order(execution, order_mock)
+        assert execution.gate_results["RECONCILIATION_OK"]["passed"] is False

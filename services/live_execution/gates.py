@@ -18,8 +18,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.config import get_settings
 from database.schema.models import LiveExecution, LiveExecutionStatus
+from services.exchange.coindcx_instruments import InstrumentMetadata
 from services.live_execution.kill_switch import is_emergency_stop_active
+from services.live_execution.sizing import calculate_precision_sized_quantity
 from services.risk_engine.fixed_margin import check_fixed_margin_trade, DAILY_TRADE_MAX
+
+# Contract Audit V2, Phase 9: how far the current live CoinDCX price may
+# deviate from the signal's own stated entry price before a candidate is
+# rejected as too stale/mispriced to fill anywhere near the intended
+# level. Deliberately conservative for a 4h-primary-timeframe system.
+MAX_ENTRY_DEVIATION_PCT = 1.5
 
 # Shared with apps/api/routers/live_execution_status.py so the status
 # endpoint's "automatic_trading" field can never drift from what the
@@ -52,6 +60,13 @@ class LiveExecutionCandidate:
     # re-derives instrument eligibility itself.
     instrument_eligible: bool = False
     instrument_eligibility_reason: str = "Not checked"
+    # Contract Audit V2, Phase 2-3/9: the caller must supply the current
+    # live CoinDCX price (for ENTRY_DEVIATION_OK) and the real instrument
+    # metadata from services/exchange/coindcx_instruments.py (for
+    # QUANTITY_VALID's precision-aware sizing) -- this module never fetches
+    # either itself, matching the existing instrument_eligible pattern.
+    current_market_price: Optional[float] = None
+    instrument_metadata: Optional[InstrumentMetadata] = None
 
 
 @dataclass
@@ -92,13 +107,30 @@ def validate_sl_tp_structure(direction: str, entry_price: float, stop_loss: Opti
     return True, "OK"
 
 
+OPEN_LIVE_STATUSES = (LiveExecutionStatus.POSITION_OPEN.value, LiveExecutionStatus.PARTIAL_EXIT.value)
+
+
 async def count_open_live_positions(session: AsyncSession) -> int:
     result = await session.execute(
-        select(func.count(LiveExecution.id)).where(
-            LiveExecution.status.in_([LiveExecutionStatus.POSITION_OPEN.value, LiveExecutionStatus.PARTIAL_EXIT.value])
-        )
+        select(func.count(LiveExecution.id)).where(LiveExecution.status.in_(OPEN_LIVE_STATUSES))
     )
     return result.scalar_one()
+
+
+async def has_conflicting_open_position(session: AsyncSession, symbol: str) -> bool:
+    """Contract Audit V2, Phase 7: CoinDCX's order side ("buy"/"sell")
+    does not unambiguously mean "open" -- if AlphaOne already has an open
+    position on this exact symbol, submitting another order for it (same
+    direction or opposite) risks adding to, reducing, or flipping that
+    existing position rather than opening the clean, independent position
+    a candidate assumes. The global POSITION_LIMIT_OK gate counts total
+    open positions across all symbols; this checks the SAME symbol
+    specifically, which POSITION_LIMIT_OK alone would not catch once
+    max_open_positions_live > 1."""
+    result = await session.execute(
+        select(func.count(LiveExecution.id)).where(LiveExecution.status.in_(OPEN_LIVE_STATUSES), LiveExecution.symbol == symbol)
+    )
+    return result.scalar_one() > 0
 
 
 async def check_all_live_execution_gates(
@@ -109,13 +141,17 @@ async def check_all_live_execution_gates(
     coindcx_account_healthy: bool,
     daily_loss_ok: bool,
     daily_loss_reason: str,
+    reconciliation_ok: bool,
+    reconciliation_reason: str,
     now: Optional[datetime] = None,
 ) -> GateReport:
-    """`daily_loss_ok`/`daily_loss_reason` are REQUIRED, not defaulted --
-    a caller that forgets to run services/live_execution/daily_loss.py's
-    check must be forced to pass an explicit value rather than silently
-    failing open (Phase 15's hard safety gate must never be skippable by
-    omission)."""
+    """`daily_loss_ok`/`daily_loss_reason` and `reconciliation_ok`/
+    `reconciliation_reason` are REQUIRED, not defaulted -- a caller that
+    forgets to run services/live_execution/daily_loss.py's check or
+    services/live_execution/reconciliation.py's last-known-status check
+    must be forced to pass an explicit value rather than silently failing
+    open (Phase 15's and Phase 10's hard safety gates must never be
+    skippable by omission)."""
     settings = get_settings()
     results: list[GateResult] = []
     now = now or datetime.utcnow()
@@ -157,7 +193,29 @@ async def check_all_live_execution_gates(
         "OK" if position_ok else f"{open_positions}/{settings.max_open_positions_live} live positions already open",
     ))
 
+    conflicting = await has_conflicting_open_position(session, candidate.symbol)
+    results.append(GateResult(
+        "NO_CONFLICTING_POSITION", not conflicting,
+        f"AlphaOne already has an open live position on {candidate.symbol} -- another order for the same "
+        f"symbol risks an ambiguous buy/sell mapping against the existing position." if conflicting else "OK",
+    ))
+
+    entry_dev_ok, entry_dev_reason = False, "No current market price provided"
+    if candidate.current_market_price is not None and candidate.current_market_price > 0 and candidate.entry_price and candidate.entry_price > 0:
+        deviation_pct = abs(candidate.current_market_price - candidate.entry_price) / candidate.entry_price * 100
+        entry_dev_ok = deviation_pct <= MAX_ENTRY_DEVIATION_PCT
+        entry_dev_reason = (
+            "OK" if entry_dev_ok else
+            f"Current price {candidate.current_market_price} deviates {deviation_pct:.2f}% from signal entry "
+            f"{candidate.entry_price} (max {MAX_ENTRY_DEVIATION_PCT}%)"
+        )
+    results.append(GateResult("ENTRY_DEVIATION_OK", entry_dev_ok, entry_dev_reason))
+
+    sizing = calculate_precision_sized_quantity(candidate.entry_price, usdt_inr_rate, candidate.instrument_metadata)
+    results.append(GateResult("QUANTITY_VALID", sizing.approved, sizing.reason))
+
     results.append(GateResult("DAILY_LOSS_LIMIT_OK", daily_loss_ok, daily_loss_reason))
+    results.append(GateResult("RECONCILIATION_OK", reconciliation_ok, reconciliation_reason))
 
     risk_check = await check_fixed_margin_trade(session, candidate.entry_price, usdt_inr_rate, now=now)
     results.append(GateResult("RISK_ENGINE_APPROVED", risk_check.approved, risk_check.reason))

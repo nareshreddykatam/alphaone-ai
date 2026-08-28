@@ -52,6 +52,16 @@ async def process_incoming_channel_message(
     if signal.status != "VALID":
         return signal
 
+    # Live Futures Auto-Trading V1, Contract Audit V2 Phase 11: the real
+    # (but AUTOMATIC_TRADING_ENABLED-gated, currently always-inert)
+    # live-execution integration point, run independently of paper
+    # execution below -- see services/live_execution/wiring.py's own
+    # docstring for why this is the traced integration point and what
+    # "inert" means here (a single settings check, zero DB/network calls,
+    # before anything else).
+    from services.live_execution.wiring import maybe_attempt_live_execution
+    await maybe_attempt_live_execution(session, signal, channel)
+
     from services.exchange.fx import get_usdt_inr_rate
     rate = await get_usdt_inr_rate()
     inr_rate = rate.rate if rate is not None else None

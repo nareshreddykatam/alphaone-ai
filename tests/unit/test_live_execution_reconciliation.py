@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from database.schema import Base
 from database.schema.models import LiveExecution, LiveExecutionStatus
 from services.exchange.base import ExchangeAccountProvider
-from services.live_execution.reconciliation import reconcile_positions
+from services.live_execution.reconciliation import (
+    reconcile_positions, record_reconciliation_result, get_last_reconciliation_status,
+)
 
 
 @pytest.fixture
@@ -41,10 +43,10 @@ class _FakeProvider(ExchangeAccountProvider):
         return []
 
 
-def _local_open(symbol="BTC/USDT", direction="LONG", quantity=0.01, status=LiveExecutionStatus.POSITION_OPEN.value):
+def _local_open(symbol="BTC/USDT", direction="LONG", quantity=0.01, status=LiveExecutionStatus.POSITION_OPEN.value, entry_price=None):
     return LiveExecution(
         idempotency_key=f"k-{symbol}", source="ALPHAONE_STRATEGY", symbol=symbol,
-        direction=direction, status=status, quantity=quantity,
+        direction=direction, status=status, quantity=quantity, entry_price=entry_price,
     )
 
 
@@ -136,6 +138,79 @@ async def test_provider_failure_is_reported_not_silently_treated_as_consistent(s
         report = await reconcile_positions(session, _FakeProvider(raise_on_positions=True))
         assert report.checked_at_ok is False
         assert report.is_consistent is False
+
+
+async def test_entry_price_mismatch_beyond_tolerance_is_flagged(session_maker):
+    async with session_maker() as session:
+        session.add(_local_open(symbol="BTC/USDT", entry_price=80000.0))
+        await session.commit()
+        provider = _FakeProvider(positions=[{"symbol": "BTC/USDT", "side": "LONG", "quantity": 0.01, "entry_price": 82000.0}])
+        report = await reconcile_positions(session, provider)
+        assert report.is_consistent is False
+        kinds = [m.kind for m in report.mismatches]
+        assert "ENTRY_PRICE_MISMATCH" in kinds
+
+
+async def test_entry_price_within_tolerance_is_not_flagged(session_maker):
+    async with session_maker() as session:
+        session.add(_local_open(symbol="BTC/USDT", entry_price=80000.0))
+        await session.commit()
+        provider = _FakeProvider(positions=[{"symbol": "BTC/USDT", "side": "LONG", "quantity": 0.01, "entry_price": 80050.0}])
+        report = await reconcile_positions(session, provider)
+        assert report.is_consistent is True
+
+
+async def test_get_last_reconciliation_status_fails_closed_when_never_run(session_maker):
+    async with session_maker() as session:
+        ok, reason = await get_last_reconciliation_status(session)
+        assert ok is False
+        assert "never run" in reason.lower()
+
+
+async def test_record_and_get_last_reconciliation_status_round_trips_consistent(session_maker):
+    async with session_maker() as session:
+        report = await reconcile_positions(session, _FakeProvider(positions=[]))
+        await record_reconciliation_result(session, report)
+    async with session_maker() as fresh_session:
+        ok, reason = await get_last_reconciliation_status(fresh_session)
+        assert ok is True
+        assert reason == "OK"
+
+
+async def test_record_and_get_last_reconciliation_status_round_trips_inconsistent(session_maker):
+    async with session_maker() as session:
+        session.add(_local_open(symbol="BTC/USDT"))
+        await session.commit()
+        report = await reconcile_positions(session, _FakeProvider(positions=[]))
+        await record_reconciliation_result(session, report)
+    async with session_maker() as fresh_session:
+        ok, reason = await get_last_reconciliation_status(fresh_session)
+        assert ok is False
+        assert "discrepanc" in reason.lower()
+
+
+async def test_record_and_get_last_reconciliation_status_reflects_a_failed_exchange_read(session_maker):
+    async with session_maker() as session:
+        report = await reconcile_positions(session, _FakeProvider(raise_on_positions=True))
+        await record_reconciliation_result(session, report)
+    async with session_maker() as fresh_session:
+        ok, reason = await get_last_reconciliation_status(fresh_session)
+        assert ok is False
+
+
+async def test_recording_a_new_result_overwrites_the_previous_one(session_maker):
+    async with session_maker() as session:
+        clean_report = await reconcile_positions(session, _FakeProvider(positions=[]))
+        await record_reconciliation_result(session, clean_report)
+
+        session.add(_local_open(symbol="ETH/USDT"))
+        await session.commit()
+        dirty_report = await reconcile_positions(session, _FakeProvider(positions=[]))
+        await record_reconciliation_result(session, dirty_report)
+
+    async with session_maker() as fresh_session:
+        ok, _ = await get_last_reconciliation_status(fresh_session)
+        assert ok is False  # reflects the latest (dirty) result, not the first clean one
 
 
 async def test_multiple_mismatches_are_all_reported_not_short_circuited(session_maker):

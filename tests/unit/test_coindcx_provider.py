@@ -258,3 +258,53 @@ async def test_direct_calls_without_credentials_raise_a_clear_auth_error():
     provider = CoinDCXReadOnlyAccountProvider()
     with pytest.raises(CoinDCXAuthError):
         await provider._post("/exchange/v1/derivatives/futures/positions", {})
+
+
+@pytest.mark.asyncio
+async def test_get_futures_conversion_rate_hits_the_real_documented_endpoint_and_parses_the_real_shape():
+    """Contract Audit V2: verbatim response shape from the official docs
+    (https://docs.coindcx.com/, fetched 2026-08-28) for
+    POST /api/v1/derivatives/futures/data/conversions -- note the base
+    path is /api/v1/, not /exchange/v1/ like every other endpoint this
+    provider calls."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "/api/v1/derivatives/futures/data/conversions" in str(request.url)
+        return httpx.Response(200, json=[
+            {"symbol": "USDTINR", "margin_currency_short_name": "INR", "target_currency_short_name": "USDT",
+             "conversion_price": 89.0, "last_updated_at": 1728460492399},
+        ])
+
+    provider, client = _account_provider(handler)
+    result = await provider.get_futures_conversion_rate(margin_currency="INR")
+    await client.aclose()
+    assert result == {"rate": 89.0, "margin_currency": "INR", "target_currency": "USDT", "last_updated_at": 1728460492399}
+
+
+@pytest.mark.asyncio
+async def test_get_futures_conversion_rate_without_credentials_returns_none_not_a_fabricated_rate():
+    provider = CoinDCXReadOnlyAccountProvider()
+    assert await provider.get_futures_conversion_rate() is None
+
+
+@pytest.mark.asyncio
+async def test_get_futures_conversion_rate_returns_none_on_http_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "server error"})
+
+    provider, client = _account_provider(handler)
+    result = await provider.get_futures_conversion_rate()
+    await client.aclose()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_futures_conversion_rate_returns_none_when_requested_currency_is_absent():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[
+            {"symbol": "USDTINR", "margin_currency_short_name": "INR", "target_currency_short_name": "USDT", "conversion_price": 89.0},
+        ])
+
+    provider, client = _account_provider(handler)
+    result = await provider.get_futures_conversion_rate(margin_currency="USDT")
+    await client.aclose()
+    assert result is None

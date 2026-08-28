@@ -7,9 +7,25 @@ import pytest
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from database.schema import Base
+from services.exchange.coindcx_instruments import InstrumentMetadata
 from services.live_execution.gates import (
     LiveExecutionCandidate, check_all_live_execution_gates, validate_sl_tp_structure,
     ORDER_CONTRACT_VERIFIED,
+)
+
+# Deliberately fine-grained precision (unlike a real instrument -- see
+# tests/unit/test_live_execution_sizing.py for real BTC/ETH/SOL/XRP
+# precision-vs-Rs.200 feasibility) so these gate tests, whose purpose is
+# to isolate OTHER gates, get a clean QUANTITY_VALID pass regardless of
+# the entry_price used in each scenario, without misrepresenting any real
+# CoinDCX instrument's actual constraints.
+_HEALTHY_INSTRUMENT = InstrumentMetadata(
+    pair="B-BTC_USDT", status="active", kind="perpetual",
+    settle_currency_short_name="USDT", quote_currency_short_name="USDT",
+    position_currency_short_name="BTC", underlying_currency_short_name="BTC", margin_currency_short_name="USDT",
+    max_leverage_long=20.0, max_leverage_short=20.0, price_increment=0.01, quantity_increment=0.00000001,
+    min_trade_size=0.00000001, min_price=0.01, max_price=10_000_000.0, min_quantity=0.00000001, max_quantity=950.0,
+    min_notional=0.01, max_notional=0.0, exit_only=False, order_types=[], time_in_force_options=[], fetched_at=0.0,
 )
 
 
@@ -28,13 +44,17 @@ def _candidate(**overrides):
         entry_price=80000.0, stop_loss=79000.0, take_profit_1=83000.0,
         signal_timestamp=datetime.utcnow(), signal_id="SIG-1",
         instrument="B-BTC_USDT", instrument_eligible=True, instrument_eligibility_reason="OK",
+        current_market_price=80100.0, instrument_metadata=_HEALTHY_INSTRUMENT,
     )
     defaults.update(overrides)
     return LiveExecutionCandidate(**defaults)
 
 
 async def _run_gates(session, candidate, **kw):
-    defaults = dict(usdt_inr_rate=88.0, market_data_healthy=True, coindcx_account_healthy=True, daily_loss_ok=True, daily_loss_reason="OK")
+    defaults = dict(
+        usdt_inr_rate=88.0, market_data_healthy=True, coindcx_account_healthy=True,
+        daily_loss_ok=True, daily_loss_reason="OK", reconciliation_ok=True, reconciliation_reason="OK",
+    )
     defaults.update(kw)
     return await check_all_live_execution_gates(session, candidate, **defaults)
 
@@ -202,6 +222,88 @@ async def test_daily_loss_gate_reflects_passed_in_value(session_maker):
         d = report.as_dict()
         assert d["DAILY_LOSS_LIMIT_OK"]["passed"] is False
         assert d["DAILY_LOSS_LIMIT_OK"]["reason"] == "down 3% today"
+
+
+async def test_entry_deviation_within_tolerance_passes(session_maker):
+    async with session_maker() as session:
+        candidate = _candidate(entry_price=80000.0, current_market_price=80500.0)  # 0.625% away
+        report = await _run_gates(session, candidate)
+        assert report.as_dict()["ENTRY_DEVIATION_OK"]["passed"] is True
+
+
+async def test_entry_deviation_beyond_tolerance_blocks(session_maker):
+    async with session_maker() as session:
+        candidate = _candidate(entry_price=80000.0, current_market_price=83000.0)  # 3.75% away
+        report = await _run_gates(session, candidate)
+        assert report.as_dict()["ENTRY_DEVIATION_OK"]["passed"] is False
+
+
+async def test_missing_current_market_price_blocks_entry_deviation_gate(session_maker):
+    async with session_maker() as session:
+        candidate = _candidate(current_market_price=None)
+        report = await _run_gates(session, candidate)
+        assert report.as_dict()["ENTRY_DEVIATION_OK"]["passed"] is False
+
+
+async def test_quantity_valid_passes_with_healthy_instrument_metadata(session_maker):
+    async with session_maker() as session:
+        report = await _run_gates(session, _candidate())
+        assert report.as_dict()["QUANTITY_VALID"]["passed"] is True
+
+
+async def test_quantity_valid_blocks_with_no_instrument_metadata(session_maker):
+    async with session_maker() as session:
+        candidate = _candidate(instrument_metadata=None)
+        report = await _run_gates(session, candidate)
+        assert report.as_dict()["QUANTITY_VALID"]["passed"] is False
+
+
+async def test_quantity_valid_blocks_when_leverage_exceeds_instrument_max(session_maker):
+    from dataclasses import replace
+    async with session_maker() as session:
+        low_leverage_instrument = replace(_HEALTHY_INSTRUMENT, max_leverage_long=5.0, max_leverage_short=5.0)
+        candidate = _candidate(instrument_metadata=low_leverage_instrument)
+        report = await _run_gates(session, candidate)
+        assert report.as_dict()["QUANTITY_VALID"]["passed"] is False
+        assert "leverage" in report.as_dict()["QUANTITY_VALID"]["reason"].lower()
+
+
+async def test_no_conflicting_position_passes_when_symbol_is_clear(session_maker):
+    async with session_maker() as session:
+        report = await _run_gates(session, _candidate(symbol="BTC/USDT"))
+        assert report.as_dict()["NO_CONFLICTING_POSITION"]["passed"] is True
+
+
+async def test_no_conflicting_position_blocks_when_same_symbol_already_open(session_maker):
+    from database.schema.models import LiveExecution, LiveExecutionStatus
+    async with session_maker() as session:
+        session.add(LiveExecution(
+            idempotency_key="existing-btc", source="ALPHAONE_STRATEGY", symbol="BTC/USDT",
+            direction="LONG", status=LiveExecutionStatus.POSITION_OPEN.value,
+        ))
+        await session.commit()
+        report = await _run_gates(session, _candidate(symbol="BTC/USDT", direction="SHORT"))
+        assert report.as_dict()["NO_CONFLICTING_POSITION"]["passed"] is False
+
+
+async def test_no_conflicting_position_ignores_a_different_symbols_open_position(session_maker):
+    from database.schema.models import LiveExecution, LiveExecutionStatus
+    async with session_maker() as session:
+        session.add(LiveExecution(
+            idempotency_key="existing-eth", source="ALPHAONE_STRATEGY", symbol="ETH/USDT",
+            direction="LONG", status=LiveExecutionStatus.POSITION_OPEN.value,
+        ))
+        await session.commit()
+        report = await _run_gates(session, _candidate(symbol="BTC/USDT"))
+        assert report.as_dict()["NO_CONFLICTING_POSITION"]["passed"] is True
+
+
+async def test_reconciliation_ok_reflects_passed_in_value(session_maker):
+    async with session_maker() as session:
+        report = await _run_gates(session, _candidate(), reconciliation_ok=False, reconciliation_reason="2 discrepancies found")
+        d = report.as_dict()
+        assert d["RECONCILIATION_OK"]["passed"] is False
+        assert d["RECONCILIATION_OK"]["reason"] == "2 discrepancies found"
 
 
 def test_validate_sl_tp_structure_unknown_direction():
