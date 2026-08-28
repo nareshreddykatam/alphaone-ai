@@ -26,18 +26,29 @@ def _raw_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def is_authorized_channel(source_channel: str) -> bool:
+def is_authorized_channel(source_channel: str, source_channel_id: Optional[str] = None) -> bool:
     """Only the configured, explicitly allowlisted channel is processed
     (Phase 21) -- everything else is ignored at the earliest possible
-    point, before even being persisted as a message worth parsing."""
+    point, before even being persisted as a message worth parsing.
+
+    Prefers the stable numeric channel ID over the username when BOTH a
+    configured ID and an observed ID are available (Phase 4: a username
+    can be reassigned to a different channel later; the numeric ID
+    cannot) -- falls back to username matching otherwise, which is all
+    the Bot API channel_post path can ever provide."""
     settings = get_settings()
-    configured = settings.telegram_external_signal_channel.lstrip("@").lower()
-    return source_channel.lstrip("@").lower() == configured
+    configured_id = settings.telegram_external_signal_channel_id.strip()
+    if configured_id and source_channel_id is not None:
+        return str(source_channel_id).strip() == configured_id
+
+    configured_username = settings.telegram_external_signal_channel.lstrip("@").lower()
+    return source_channel.lstrip("@").lower() == configured_username
 
 
 async def ingest_message(
     session: AsyncSession, source_channel: str, telegram_message_id: str,
     message_timestamp: datetime, text: str, edited_timestamp: Optional[datetime] = None,
+    source_channel_id: Optional[str] = None,
 ) -> Optional[ExternalTelegramMessage]:
     """Idempotent: a duplicate delivery of the same (channel, message_id)
     is recognized and returns the EXISTING row unchanged (Phase 23:
@@ -63,7 +74,8 @@ async def ingest_message(
         return existing
 
     message = ExternalTelegramMessage(
-        source_channel=source_channel, telegram_message_id=telegram_message_id,
+        source_channel=source_channel, source_channel_id=str(source_channel_id) if source_channel_id is not None else None,
+        telegram_message_id=telegram_message_id,
         message_timestamp=message_timestamp, text=text, raw_hash=_raw_hash(text),
     )
     session.add(message)
@@ -95,7 +107,7 @@ async def process_message(
     production; a fixed fake in tests) -- kept as a parameter rather than
     a hard import so this function has no network dependency of its own.
     """
-    if not is_authorized_channel(message.source_channel):
+    if not is_authorized_channel(message.source_channel, message.source_channel_id):
         signal = ExternalSignal(
             message_id=message.id, source_channel=message.source_channel,
             status=ExternalSignalStatus.REJECTED_UNAUTHORIZED_SOURCE.value,

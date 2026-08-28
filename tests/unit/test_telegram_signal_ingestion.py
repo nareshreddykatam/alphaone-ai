@@ -34,6 +34,35 @@ def test_only_the_allowlisted_channel_is_authorized():
     assert is_authorized_channel("@SUNCRYPTO_TRADING_ALERTS") is True  # case-insensitive
 
 
+def test_channel_id_is_preferred_over_username_when_both_configured(monkeypatch):
+    """Phase 4: a username can be reassigned to a different channel later;
+    the numeric ID cannot -- when a channel ID is configured, it must be
+    the deciding factor, not a matching (or even mismatched) username."""
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "telegram_external_signal_channel_id", "-100123456789")
+
+    assert is_authorized_channel("@suncrypto_trading_alerts", "-100123456789") is True
+    # Same real channel ID but a DIFFERENT (e.g. renamed) username -- still authorized by ID.
+    assert is_authorized_channel("@renamed_channel", "-100123456789") is True
+    # Matching username but a DIFFERENT numeric ID (e.g. the username was
+    # reassigned to an impostor channel) -- must be REJECTED by ID, not
+    # waved through because the username still matches.
+    assert is_authorized_channel("@suncrypto_trading_alerts", "-100999999999") is False
+
+
+def test_falls_back_to_username_when_no_channel_id_observed(monkeypatch):
+    """The Bot API path can supply an ID; some callers may not -- when no
+    source_channel_id is observed at all, username matching still applies
+    even if a channel ID IS configured (nothing to compare against)."""
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "telegram_external_signal_channel_id", "-100123456789")
+
+    assert is_authorized_channel("@suncrypto_trading_alerts", None) is True
+    assert is_authorized_channel("@some_other_channel", None) is False
+
+
 async def test_unauthorized_channel_is_rejected_before_parsing(session_maker):
     async with session_maker() as session:
         message = await ingest_message(session, "@random_channel", "1", datetime(2026, 1, 1), "BTC/USDT LONG\nEntry: 80000\nSL: 79000\nTP1: 83000")

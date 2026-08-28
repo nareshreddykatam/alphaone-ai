@@ -1,0 +1,186 @@
+============================================================
+ALPHAONE AI -- MULTI-COIN AI FUTURES SYSTEM
+MTProto EXTERNAL SIGNAL INGESTION V1
+============================================================
+
+Real infrastructure, honestly reported. AlphaOne's operator does not own
+or administer @suncrypto_trading_alerts, so the Bot API channel-post
+approach (reports/TELEGRAM_SIGNAL_RESEARCH_V1.txt) cannot reach it --
+confirmed for real in the prior verification pass via a live
+getChatMember call that returned "Member list is inaccessible". This
+report covers the MTProto (user-account) alternative built this pass.
+
+============================================================
+1. CONNECTION STATUS -- READ FIRST
+============================================================
+
+REAL MTProto CONNECTION ESTABLISHED: NO
+REAL CHANNEL MESSAGE OBSERVED: NO
+
+REASON: MTProto login requires a real Telegram user account -- your own
+phone number, a login code Telegram sends to your phone/Telegram app, and
+your 2FA password if you have one enabled. None of that can be provided
+by, requested through, or safely entered into this chat session -- doing
+so would mean sharing account-level credentials with an automated
+process, which this task's own safety rules explicitly forbid ("Do NOT
+ask me to paste authentication codes or passwords into source code or
+chat"). This is a hard requirement of how Telegram's MTProto
+authentication works, not a limitation of the code below.
+
+============================================================
+2. WHAT WAS BUILT (real code, real tests, no live connection)
+============================================================
+
+Library: Telethon 1.44.0 (pure-Python MTProto client, actively
+maintained, added to pyproject.toml). Verified importable under this
+project's actual Python 3.14 interpreter.
+
+services/telegram_mtproto/client.py -- the listener:
+  - MTProtoListener: start()/stop()/is_running(), mirroring the exact
+    lifecycle shape of services/market_data/live_state.py's
+    _StartupRetrySupervisor (same reconnect-backoff ladder: 2/4/8/16/30s,
+    holds at 30s). start() is a safe no-op (logs and returns) unless
+    TELEGRAM_MTPROTO_ENABLED=true AND all three of TELEGRAM_API_ID/
+    TELEGRAM_API_HASH/TELEGRAM_SESSION are set. Never blocks FastAPI's
+    own event loop (uses client.connect(), never the blocking
+    run_until_disconnected() convenience call).
+  - Wired into apps/api/main.py's lifespan exactly like the scheduler and
+    the CoinDCX market-data WebSocket -- started at app startup if
+    enabled, cleanly stopped at shutdown.
+  - Read-only by construction: the ONLY TelegramClient calls made are
+    connect(), is_user_authorized(), get_entity() (a read lookup used
+    once to resolve the channel to Telethon's own internal entity object,
+    which its event filter then matches against), and
+    add_event_handler(). Verified automatically --
+    tests/unit/test_no_order_placement_capability.py now scans this
+    module's source for every mutating TelegramClient method that exists
+    on the installed Telethon version (send_message, send_file,
+    forward_messages, edit_message, edit_admin, edit_permissions,
+    edit_folder, edit_2fa, delete_messages, delete_dialog,
+    send_read_acknowledge) plus the login-flow calls (sign_in,
+    send_code_request, client.start()) -- none may appear in client.py.
+
+services/telegram_mtproto/setup_session.py -- the ONE-TIME, MANUAL
+authentication step. This script is never imported or run by any
+AlphaOne process, test, or this session -- it is meant to be run BY YOU,
+in YOUR OWN terminal, exactly once. It:
+  1. Reads TELEGRAM_API_ID/TELEGRAM_API_HASH from your environment (you
+     obtain these yourself from https://my.telegram.org, tied to your
+     own Telegram account -- nothing this codebase can generate).
+  2. Runs Telethon's standard interactive login (phone number -> code
+     Telegram sends you -> 2FA password if enabled) directly against
+     Telegram's own servers -- this script only ever talks to Telegram,
+     never to any AlphaOne server.
+  3. Prints a session string ONCE, to your terminal, with an explicit
+     instruction to treat it like a password and put it in your own
+     .env (or platform secret store), never Git.
+Verified this script never logs, writes to a file, or otherwise persists
+the session string anywhere except that one print statement
+(tests/unit/test_no_order_placement_capability.py::
+test_mtproto_setup_script_never_persists_or_logs_the_session_string).
+
+Shared pipeline refactor: services/telegram_signals/pipeline.py now
+holds the single, canonical "ingest -> parse -> validate -> risk ->
+paper-execute -> notify" sequence -- BOTH services/telegram/bot.py's Bot
+API channel_post handler AND the new MTProto listener call this exact
+same function. Nothing about parsing, validation, risk, or paper
+execution was duplicated or reimplemented for MTProto -- per the explicit
+instruction to reuse existing components and only replace/extend the
+channel-reading layer.
+
+Channel-ID-preferred authorization (Phase 4): services/telegram_signals/
+ingestion.py's is_authorized_channel() now accepts an optional numeric
+channel ID and prefers it over the username when a
+TELEGRAM_EXTERNAL_SIGNAL_CHANNEL_ID is configured -- a username can be
+reassigned to a different channel later; Telegram's numeric channel ID
+cannot. The Bot API path also now supplies its own available channel ID
+(post.chat.id) as a bonus consistency improvement. ExternalTelegramMessage
+gained a new source_channel_id column to record whichever ID (if any) was
+observed at ingestion time.
+
+============================================================
+3. CREDENTIAL SECURITY
+============================================================
+
+- TELEGRAM_SESSION is a Telethon StringSession -- an opaque string held
+  only in an environment variable, never a session FILE, so there is no
+  file artifact to ever leave on a Railway filesystem or get committed by
+  accident. .gitignore was extended with *.session/*.session-journal as
+  defense-in-depth regardless (in case anyone runs Telethon ad hoc with
+  file-based sessions locally).
+- Nothing in this pass printed, logged, or persisted an API_ID, API_HASH,
+  phone number, login code, 2FA password, or session string anywhere
+  except setup_session.py's own one-time terminal output (which only the
+  human running it ever sees).
+- No .env file was read, modified, or exposed by this session -- config
+  presence was checked via SET/NOT_SET only (see Section 1's underlying
+  investigation), matching the exact discipline used in the prior
+  verification pass.
+
+============================================================
+4-8. CHANNEL MESSAGES / SIGNAL FORMAT / PARSER / MULTI-COIN / RISK
+============================================================
+
+Not applicable -- see Section 1. No real message has been observed
+through either transport (Bot API or MTProto). Once a real session string
+is generated (by you, via setup_session.py) and TELEGRAM_MTPROTO_ENABLED
+is set to true, the exact same parser/validation/risk/paper-execution
+machinery already verified in reports/TELEGRAM_SIGNAL_RESEARCH_V1.txt
+applies unchanged -- nothing about that machinery differs by transport.
+
+============================================================
+9. WHAT YOU NEED TO DO TO GO LIVE (safe, manual, step-by-step)
+============================================================
+
+1. Go to https://my.telegram.org, log in with YOUR Telegram phone number,
+   open "API development tools", and create an app -- this gives you an
+   API_ID and API_HASH tied to your own account. AlphaOne never sees your
+   phone number or password during this step; it happens entirely on
+   Telegram's own site.
+2. In your own terminal (NOT this chat), with this repo's virtualenv
+   active, set TELEGRAM_API_ID and TELEGRAM_API_HASH as environment
+   variables, then run:
+     python services/telegram_mtproto/setup_session.py
+   Follow its prompts (phone number, the code Telegram sends you, your
+   2FA password if you have one). It prints a session string once.
+3. Put the three values plus TELEGRAM_MTPROTO_ENABLED=true into your own
+   .env (local) or your deployment platform's secret store (production)
+   -- never into Git, never into this chat.
+4. Restart the AlphaOne API process. The listener starts automatically
+   (apps/api/main.py's lifespan) and begins reading
+   @suncrypto_trading_alerts read-only from that point on.
+
+Your Telegram user account only needs to be a member able to VIEW the
+public channel -- @suncrypto_trading_alerts is public, so simply having
+joined it (or even just being able to view it, since Telethon can resolve
+a public channel's entity by username without joining) is sufficient;
+no admin rights of any kind are required for MTProto, unlike the Bot API
+path.
+
+============================================================
+10. TESTS
+============================================================
+
+7 new tests for the listener (tests/unit/test_mtproto_listener.py):
+config-gated startup, no-duplicate-start, safe stop when never started,
+event routing into the shared pipeline with the correct channel/ID/text,
+empty-message handling. 2 new tests for channel-ID-preferred
+authorization (tests/unit/test_telegram_signal_ingestion.py). 4 new
+security tests (no mutating Telethon calls, login flow isolated to the
+manual script, setup script never persists the session, pipeline module
+never imports the CoinDCX order client). Full suite: see the git commit
+this report ships with for the exact passing count.
+
+============================================================
+11. LIMITATIONS
+============================================================
+
+- No real MTProto connection has been established -- this is
+  infrastructure-readiness, not a live-connection confirmation.
+- The channel's real message format remains unobserved (same limitation
+  as the Bot API report) -- the existing parser handles the two example
+  formats from the original task spec plus reasonable variations, but has
+  not been validated against this specific channel's actual historical
+  messages.
+- Telethon's flood-wait / rate-limit handling relies on the library's own
+  defaults -- not independently stress-tested in this pass.

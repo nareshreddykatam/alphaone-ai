@@ -539,6 +539,12 @@ class ExternalTelegramMessage(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     source_channel = Column(String(100), nullable=False)
+    # Stable numeric Telegram channel ID, when the ingestion path can
+    # resolve one (MTProto can; the Bot API channel_post path cannot
+    # without extra calls) -- preferred over the username for
+    # authorization once available, since a username can be reassigned to
+    # a different channel later but the numeric ID cannot (Phase 4).
+    source_channel_id = Column(String(30), nullable=True)
     telegram_message_id = Column(String(30), nullable=False)
     message_timestamp = Column(DateTime, nullable=False)
     edited_timestamp = Column(DateTime, nullable=True)

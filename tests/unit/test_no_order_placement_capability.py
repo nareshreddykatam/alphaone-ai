@@ -208,6 +208,64 @@ def test_telegram_signal_pipeline_never_imports_coindcx_order_client():
         assert "CoinDCXReadOnlyAccountProvider" not in source
 
 
+# Every mutating Telethon TelegramClient method -- confirmed by direct
+# introspection of the installed telethon.TelegramClient (see the audit
+# performed while building this module): send_message, send_file,
+# forward_messages, edit_message, edit_admin, edit_permissions,
+# edit_folder, edit_2fa, delete_messages, delete_dialog,
+# send_read_acknowledge. send_code_request/sign_in (the login-flow calls)
+# are deliberately included too -- those must exist ONLY in the separate,
+# human-run services/telegram_mtproto/setup_session.py, never in the
+# listener itself.
+TELETHON_MUTATING_METHODS = (
+    "send_message", "send_file", "send_album", "forward_messages", "edit_message", "edit_admin",
+    "edit_permissions", "edit_folder", "edit_2fa", "delete_messages", "delete_dialog",
+    "send_read_acknowledge",
+)
+
+
+def test_mtproto_listener_never_calls_a_mutating_telethon_method():
+    """Multi-Coin AI Futures System: the MTProto listener (services/
+    telegram_mtproto/client.py) must remain strictly read-only -- connect,
+    is_user_authorized, get_entity, and add_event_handler are the only
+    TelegramClient calls it's allowed to make."""
+    import services.telegram_mtproto.client as mtproto_module
+    source = inspect.getsource(mtproto_module)
+    for method in TELETHON_MUTATING_METHODS:
+        assert f".{method}(" not in source, f"telegram_mtproto/client.py must never call TelegramClient.{method}()"
+    assert "services.exchange.coindcx" not in source
+    assert "CoinDCXReadOnlyAccountProvider" not in source
+
+
+def test_mtproto_login_flow_is_isolated_to_the_manual_setup_script():
+    """send_code_request/sign_in (the interactive login calls) must exist
+    ONLY in the separate, human-run setup_session.py -- never in the
+    listener client.py that a server process runs unattended."""
+    import services.telegram_mtproto.client as mtproto_module
+    source = inspect.getsource(mtproto_module)
+    assert ".sign_in(" not in source
+    assert ".send_code_request(" not in source
+    assert "client.start(" not in source  # Telethon's interactive login convenience call
+
+
+def test_mtproto_setup_script_never_persists_or_logs_the_session_string():
+    """The one-time human-run setup script must only ever print the
+    session string directly to the terminal (for the human to copy) --
+    never write it to a file, never pass it to a logger."""
+    import services.telegram_mtproto.setup_session as setup_module
+    source = inspect.getsource(setup_module)
+    assert "logger" not in source.lower()
+    assert "open(" not in source  # never writes any file
+    assert ".write(" not in source
+
+
+def test_pipeline_never_imports_coindcx_order_client():
+    import services.telegram_signals.pipeline as pipeline_module
+    source = inspect.getsource(pipeline_module)
+    assert "services.exchange.coindcx" not in source
+    assert "CoinDCXReadOnlyAccountProvider" not in source
+
+
 def test_paper_trader_never_imports_a_real_exchange_order_client():
     """The paper-trading engine must never import anything from
     services.exchange.coindcx beyond what read-only market context needs

@@ -34,6 +34,28 @@ class Settings(BaseSettings):
     # Telegram-platform precondition this code cannot arrange or fake.
     telegram_external_signals_enabled: bool = False
     telegram_external_signal_channel: str = "@suncrypto_trading_alerts"
+    # Stable numeric channel ID, once known (resolved once via MTProto's
+    # get_entity() -- see services/telegram_mtproto/setup_session.py's
+    # printed output after a successful one-time login). Preferred over
+    # the username for authorization when set, since a username can be
+    # reassigned to a different channel later but the numeric ID cannot
+    # (Phase 4). Empty by default -- username-only matching still applies.
+    telegram_external_signal_channel_id: str = ""
+
+    # Multi-Coin AI Futures System: read-only MTProto ingestion via a real
+    # Telegram USER ACCOUNT (services/telegram_mtproto/), required because
+    # the Bot API can only receive channel_post updates for a channel the
+    # bot itself administers, and @suncrypto_trading_alerts is a third-
+    # party channel AlphaOne's operator does not own or administer.
+    # TELEGRAM_SESSION is a Telethon StringSession (produced ONCE, by the
+    # user, running services/telegram_mtproto/setup_session.py themselves
+    # in their own terminal -- never generated or seen by this codebase's
+    # own automated processes) -- treat it exactly like a password: never
+    # logged, never committed, never printed.
+    telegram_mtproto_enabled: bool = False
+    telegram_api_id: str = ""
+    telegram_api_hash: str = ""
+    telegram_session: str = ""
 
     model_path: str = "./ml/models"
     model_version: str = "v1"

@@ -317,53 +317,17 @@ class TelegramBot:
         if not settings.telegram_external_signals_enabled:
             return
 
-        from services.telegram_signals.ingestion import is_authorized_channel, ingest_message, process_message
-        from services.telegram_signals.paper_execution import execute_valid_signal
+        from services.telegram_signals.pipeline import process_incoming_channel_message
 
         channel = f"@{post.chat.username}" if post.chat.username else str(post.chat.id)
-        if not is_authorized_channel(channel):
-            logger.warning("Ignoring channel post from an unauthorized/unallowlisted channel", channel=channel)
-            return
-
         is_edit = update.edited_channel_post is not None
+
         async with async_session() as session:
-            message = await ingest_message(
-                session, channel, str(post.message_id), post.date.replace(tzinfo=None),
-                post.text, edited_timestamp=(post.edit_date.replace(tzinfo=None) if is_edit and post.edit_date else None),
+            await process_incoming_channel_message(
+                session, channel, str(post.message_id), post.date.replace(tzinfo=None), post.text,
+                edited_timestamp=(post.edit_date.replace(tzinfo=None) if is_edit and post.edit_date else None),
+                channel_id=str(post.chat.id),
             )
-
-            from services.scanner.multi_coin import DEFAULT_WHITELIST
-            supported = set(DEFAULT_WHITELIST)
-
-            async def _price_lookup(symbol: str):
-                from services.scanner.multi_coin import check_instrument_availability
-                results = await check_instrument_availability([symbol])
-                return results[0].last_price if results and results[0].available else None
-
-            signal = await process_message(session, message, supported, current_price_lookup=_price_lookup)
-            logger.info("External Telegram signal processed", channel=channel, status=signal.status, symbol=signal.symbol)
-
-            if signal.status == "VALID":
-                from services.exchange.fx import get_usdt_inr_rate
-                rate = await get_usdt_inr_rate()
-                inr_rate = rate.rate if rate is not None else None
-                position, reason = await execute_valid_signal(session, signal, inr_rate)
-                if position is not None:
-                    logger.info("External Telegram signal opened a paper position", trade_id=position.trade_id)
-                    if self.enabled:
-                        await self.send_paper_signal({
-                            "symbol": signal.symbol, "market": f"CoinDCX {signal.symbol} Perpetual",
-                            "timeframe": signal.timeframe_stated or "unspecified",
-                            "strategy_sources": [f"TELEGRAM:{channel}"], "direction": signal.direction,
-                            "probability_long": None, "probability_short": None, "probability_no_trade": None,
-                            "expected_return": None, "expected_volatility": None, "regime": "UNKNOWN",
-                            "confidence": "EXTERNAL_SIGNAL", "entry": signal.entry_price, "stop_loss": signal.stop_loss,
-                            "take_profit_1": signal.take_profit_1, "take_profit_2": signal.take_profit_2,
-                            "take_profit_3": signal.take_profit_3, "risk_reward": None,
-                            "model_status": "NO_MODEL_DEPLOYED", "model_version": None,
-                        })
-                else:
-                    logger.info("External Telegram signal was VALID but not executed", reason=reason)
 
     # ---- inbound commands, all real DB reads --------------------------
 

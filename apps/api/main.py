@@ -11,6 +11,7 @@ from database.schema import engine, Base, get_db
 from database.schema.migrations import run_schema_migrations
 from services.market_data.live_state import start_market_data_ws, stop_market_data_ws
 from services.scheduler.runner import scheduler
+from services.telegram_mtproto.client import mtproto_listener
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -41,11 +42,24 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("CoinDCX live market-data WebSocket disabled (MARKET_DATA_WS_ENABLED=false)")
 
+    if settings.telegram_mtproto_enabled:
+        # mtproto_listener.start() itself no-ops (logs and returns) if
+        # TELEGRAM_API_ID/API_HASH/SESSION aren't all set -- see
+        # services/telegram_mtproto/client.py. Read-only ingestion of
+        # @suncrypto_trading_alerts; never blocks startup, never sends
+        # anything.
+        mtproto_listener.start()
+        logger.info("Telegram MTProto external-signal listener enabled")
+    else:
+        logger.info("Telegram MTProto external-signal listener disabled (TELEGRAM_MTPROTO_ENABLED=false)")
+
     yield
     if settings.scheduler_enabled:
         await scheduler.stop()
     if settings.market_data_ws_enabled:
         await stop_market_data_ws()
+    if settings.telegram_mtproto_enabled:
+        await mtproto_listener.stop()
     logger.info("AlphaOne BTC AI shutting down")
     await engine.dispose()
 

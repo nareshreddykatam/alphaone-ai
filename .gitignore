@@ -37,6 +37,14 @@ ml/models/*.json
 *.db
 *.sqlite
 
+# Telegram MTProto sessions -- never commit a session file/string
+# (equivalent to a password). The supported pattern (services/
+# telegram_mtproto/setup_session.py) uses a StringSession stored only in
+# an env var, never a file, but this protects against a local .session
+# file from a manual/ad-hoc Telethon run.
+*.session
+*.session-journal
+
 # Docker
 docker-compose.override.yml
 
