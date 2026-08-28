@@ -103,6 +103,64 @@ async def outcome_evaluation_job(session: AsyncSession, symbol: str = "BTC/USDT"
     return await evaluate_pending_signal_outcomes(session, symbol=symbol, timeframe=timeframe)
 
 
+async def ai_paper_trading_job(session: AsyncSession, symbol: str = "BTC/USDT", timeframe: str = "4h") -> list:
+    """AI Trading V1, Phases 8/11/13: enriches every signal
+    signal_generation_job just persisted this tick with AI evidence
+    (services/signal_engine/ai_orchestrator.py -- regime, expected
+    volatility, and a calibrated model probability ONLY if a validated
+    model has actually been deployed), then feeds each qualifying
+    decision to the process-wide paper trader
+    (services/paper_trader/live_state.py). Returns the AIDecision dicts
+    for any position NEWLY opened this tick, for Telegram.
+
+    Deliberately called AFTER signal_generation_job in the same tick
+    (see services/scheduler/runner.py) rather than as an independently-
+    scheduled loop, specifically to avoid a read-after-write race: this
+    function reads back the Signal rows signal_generation_job just
+    committed, so it must run strictly after that commit, not on its own
+    clock. Position management (SL/TP1/TP2/TP3 checks on already-open
+    paper positions) runs on EVERY call regardless of whether a new
+    signal fired or the model-health gate below allows a NEW position --
+    a degraded model is never a reason to stop managing risk on an
+    already-open paper trade.
+    """
+    from services.model_monitor.monitor import evaluate_model_health, ModelHealthStatus
+    from services.paper_trader.live_state import paper_trader
+    from services.paper_trader.persistence import persist_paper_open, persist_paper_event
+    from services.signal_engine.ai_orchestrator import enrich_signal_with_ai_evidence
+    from services.signal_engine.live_signal import _load_recent_candles, DEFAULT_LOOKBACK_BARS, MIN_BARS_REQUIRED
+
+    df = await _load_recent_candles(session, symbol, timeframe, DEFAULT_LOOKBACK_BARS)
+    if len(df) < MIN_BARS_REQUIRED:
+        return []  # not enough real data yet -- never fabricate a decision
+
+    last_candle = df.iloc[-1]
+    for event in paper_trader.process_candle(last_candle):
+        await persist_paper_event(session, event)
+
+    health = await evaluate_model_health(session)
+    if health.status == ModelHealthStatus.DISABLED:
+        logger.warning("AI paper trading: new positions refused this tick", reasons=health.reasons)
+        return []
+
+    result = await session.execute(
+        select(Signal).where(
+            Signal.symbol == symbol, Signal.timeframe == timeframe,
+            Signal.timestamp == last_candle["timestamp"], Signal.signal_type.in_(["LONG", "SHORT"]),
+        )
+    )
+    signals = list(result.scalars().all())
+
+    opened = []
+    for signal in signals:
+        decision = await enrich_signal_with_ai_evidence(session, df, signal, symbol=symbol)
+        position = paper_trader.open_position(signal, current_price=float(last_candle["close"]))
+        if position is not None:
+            await persist_paper_open(session, position, symbol=symbol)
+            opened.append(decision)
+    return opened
+
+
 async def candle_ingestion_job(
     session: AsyncSession,
     exchange: BinanceExchange,

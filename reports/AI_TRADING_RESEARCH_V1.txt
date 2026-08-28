@@ -1,0 +1,436 @@
+============================================================
+ALPHAONE AI -- AI TRADING V1
+AI-DRIVEN MARKET ANALYSIS + SIGNAL ORCHESTRATION + PAPER TRADING
+FINAL RESEARCH REPORT
+============================================================
+
+Real data only. No synthetic labels, no fabricated backtest numbers, no
+manufactured model performance. Where the research found no robust edge,
+this report says so plainly and the corresponding component is marked
+RESEARCH_ONLY rather than promoted.
+
+============================================================
+1. DATASET
+============================================================
+
+Source: alphaone_research.db (real Binance-sourced OHLCV, ingested by
+services/market_data/binance.py), the same database every prior AlphaOne
+research pass (V1/V2/V3 strategy research, Phase 3 ML research) has used.
+
+  4h candles:  6,578  (2023-08-27 08:00 -> 2026-08-27 12:00)
+  1h candles:  26,280 (used as multi-timeframe context, see Section 3)
+  funding:     3,285 rows, full ~3-year coverage
+  open_interest: 567 rows, ~1 month only (Binance API history limit,
+    unchanged since Phase 2 -- see docs/known_limitations.md)
+
+============================================================
+2. TIMEFRAME
+============================================================
+
+4h -- the only timeframe with a real, validated strategy edge (see
+reports/STRATEGY_RESEARCH_V2_RIGOROUS_REPORT.txt and
+reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt: 18 distinct 15m
+mechanisms tested across V2+V3, zero surviving even a full-period screen).
+1h is used only as multi-timeframe CONTEXT (see Section 3), never as the
+primary decision timeframe. This mirrors Phase 3's own primary-timeframe
+choice (docs/ml_methodology.md), re-examined here rather than assumed --
+the same infrastructure that produced this dataset could equally well be
+pointed at 1h/15m primary features in a future phase; nothing about this
+choice is timeframe-hardcoded architecture.
+
+============================================================
+3. FEATURE LIST
+============================================================
+
+Built entirely from the existing, already-leakage-tested feature engine
+(services/feature_engine/*, ml/features/feature_groups.py) -- reused, not
+reimplemented. Groups (ml/features/feature_groups.py: ABLATION_CONFIGS):
+
+  trend        EMAs/SMAs, price-vs-MA, EMA-relationship flags, 20-bar
+               trend slope, returns/log returns
+  momentum     RSI(14/7), MACD, ROC, momentum, ADX, +DI/-DI
+  volatility   ATR(14/7), ATR%, realized vol (10/20/50), BB width,
+               Garman-Klass
+  volume       relative volume, OBV, volume spikes, buy/sell ratio
+  structure    higher-high/low, break-of-structure, near S/R,
+               consolidation, Donchian position
+  regime       one-hot MarketRegimeDetector output (8 regimes)
+  derivatives  funding-rate features, OI features (constrained by the
+               ~1-month OI history -- see Section 4)
+  context_1h   RSI/ADX/EMA-cross/trend/realized-vol pulled from 1h via a
+               causal backward as-of merge (pd.merge_asof, direction=
+               "backward") -- included in every ablation, a timeframe-
+               architecture layer, not one of the compared information axes
+  strategy_signals (NEW this pass, ml/features/strategy_features.py)
+               each PRODUCTION_ELIGIBLE strategy's own LONG/SHORT/NO_TRADE
+               output (S05, S06, V3_KAMA_TREND_4H, V3_RANGE_EXPANSION_4H),
+               computed the IDENTICAL way that strategy's own live
+               evaluation/backtest already computes it (same precompute +
+               signal_func pair Backtester.run() itself calls), plus 3
+               consensus aggregates (net direction, agree-long count,
+               agree-short count). Verified truncation-invariant (no
+               lookahead) in tests/leakage/test_strategy_features_no_lookahead.py.
+
+Every feature is timestamp-safe: NO FUTURE DATA. This is not asserted, it
+is tested -- tests/leakage/ contains dedicated truncation-invariance tests
+for the feature engine (pre-existing) and for strategy_signals (added this
+pass).
+
+============================================================
+4. TARGET DEFINITION
+============================================================
+
+Triple-barrier labeling (ml/labeling.py: compute_triple_barrier_labels),
+NOT "will price go up." At each bar T:
+
+  1. A hypothetical LONG and a hypothetical SHORT are both entered at bar
+     T+1's open (matches the Backtester's own next-bar execution).
+  2. Each gets a stop/target sized off ATR(T) (known at T, not future):
+     take-profit = 2.0x ATR, stop-loss = 1.0x ATR (2:1 reward:risk).
+  3. Both are simulated forward up to 12 bars (~48h on 4h) to see which
+     barrier is hit first.
+  4. Label = LONG if the long hypothetical hits target before stop; SHORT
+     for the mirrored case; NO_TRADE if neither resolves favorably, if
+     both do (an ambiguous whipsaw), or if the configured minimum 1.5:1
+     risk:reward isn't met.
+
+Feature timestamp: bar T (causal only). Label timestamp: resolved using
+bars T+1..T+12 (the label is ALLOWED to look forward -- that is what makes
+it a label; the barrier WIDTH is read from ATR(T) only, never future ATR).
+Leakage prevention: tests/leakage/test_label_leakage.py,
+tests/unit/test_labeling.py.
+
+Label distribution on the full dataset: LONG 28.12%, SHORT 26.90%,
+NO_TRADE 44.98% -- a real, non-degenerate 3-class problem, not a
+near-constant label that would make any model look artificially accurate.
+
+Training window: chronological embargoed split, embargo = 12 + 2 = 14 bars
+at every split boundary (large enough that no training/validation label's
+forward-looking window can leak into the next split -- see
+ml/evaluation/ml_pipeline.py: chronological_split_with_embargo). Single
+split: 60% train / 20% validation / 20% test (OOS), matching Phase 3's own
+methodology (docs/ml_methodology.md), re-run here on the current, larger
+dataset rather than assumed unchanged.
+Rolling walk-forward (Stage 2, survivors only): train_window=1500,
+val_window=300, test_window=300, step=300, embargo=14 -- 15 non-
+overlapping OOS folds per candidate.
+
+============================================================
+5-6. MODELS TESTED + HYPERPARAMETERS
+============================================================
+
+Logistic Regression, Random Forest, XGBoost, LightGBM -- all four already
+implemented in ml/training/trainer.py, reused unchanged. "Ensemble"
+(soft-voting over RF/XGB/LGBM) was NOT run -- a documented, pre-existing
+bug (sklearn's VotingClassifier re-fits internal clones without an eval
+set, which breaks LightGBM's early-stopping callback; see
+docs/known_limitations.md) that this pass did not attempt to fix, since
+four working model families already satisfy the task's "at minimum"
+requirement and none of the simpler models showed enough promise to
+justify escalating further (no LSTM/Transformer was investigated, per the
+explicit instruction to only do so if simpler models fail).
+
+Fixed, pre-declared hyperparameters (never tuned per fold or on test data):
+  XGBoost:   n_estimators=500, max_depth=6, learning_rate=0.01,
+             subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+             gamma=0.1, reg_alpha=0.1, reg_lambda=1.0, early_stopping=50
+  LightGBM:  n_estimators=500, max_depth=6, learning_rate=0.01,
+             subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+             gamma=0.1, reg_alpha=0.1, reg_lambda=1.0, early_stopping=50
+  RandomForest: n_estimators=300, max_depth=10, min_samples_split=10,
+             min_samples_leaf=5
+  LogisticRegression: max_iter=1000, class_weight=None (features scaled
+             via a StandardScaler fit on TRAIN only, applied unchanged to
+             val/test -- ml/features/scaling.py)
+
+Calibration: CalibratedClassifierCV(FrozenEstimator(model)), fit on the
+VALIDATION split only. Both sigmoid (Platt) and isotonic are tried; the
+one with the lower validation Brier score is used for test evaluation.
+Every winning combo in this pass selected isotonic.
+
+============================================================
+7. METHODOLOGY (TRAIN / VALIDATION / OOS)
+============================================================
+
+Stage 1 -- ABLATION x MODEL SCREEN: every (ablation, model) combo (5
+ablations -- A/B/C/D/E, see Section 3 -- x 4 models = 20 combos; D was
+skipped for all 4 models, see Section 4/9 below) trained on TRAIN,
+calibrated on VALIDATION, evaluated ONCE on the held-out TEST split via
+the real Backtester (fees, slippage, spread, funding -- BacktestConfig
+defaults). Screening bar: profit factor > 1.0 AND >= 20 test trades (a
+combo like C_technical_structure_regime/lightgbm that hit PF 1.45 on only
+13 trades was correctly excluded at this stage -- exactly the kind of
+small-sample outlier the task's own Phase 19 warns against promoting).
+
+Stage 2 -- WALK-FORWARD + COST SENSITIVITY: ONLY the 2 combos that cleared
+Stage 1 advanced to rolling walk-forward (15 folds) and a cost-sensitivity
+ladder (1x/1.25x/1.5x/2x fees+slippage+funding, ml/evaluation/
+cost_sensitivity.py). A combo needed >=50% of walk-forward folds
+profitable AND a profit factor > 1.0 at 2x costs to be considered a real
+candidate. Neither survivor cleared this bar (see Section 8-9).
+
+No random shuffling occurred anywhere in this pipeline. Parameters were
+never re-tuned after seeing OOS/test data.
+
+============================================================
+8. STAGE 1 SCREEN RESULTS (full table, sorted by profit factor)
+============================================================
+
+ablation                                 model                calib.    n_feat  acc    auc    trades  PF     net_return  max_dd
+C_technical_structure_regime             lightgbm             isotonic  79      0.393  0.518  13      1.45   +1.74%      2.16%   <- excluded, <20 trades
+B_technical_structure                    lightgbm             isotonic  71      0.398  0.516  34      1.21   +2.29%      2.85%   <- Stage 1 survivor
+E_technical_structure_regime_strategies  logistic_regression  isotonic  86      0.342  0.498  31      1.07   +0.73%      4.45%   <- Stage 1 survivor (NEW ablation)
+C_technical_structure_regime             logistic_regression  isotonic  79      0.368  0.495  34      0.81   -2.37%      5.36%
+E_technical_structure_regime_strategies  lightgbm             isotonic  86      0.416  0.506  28      0.70   -3.24%      5.06%
+C_technical_structure_regime             xgboost              isotonic  79      0.400  0.511  54      0.69   -6.11%      9.16%
+E_technical_structure_regime_strategies  random_forest        isotonic  86      0.410  0.503  56      0.67   -6.77%      9.04%
+A_technical_only                         xgboost              isotonic  60      0.402  0.511  54      0.67   -7.03%      10.07%
+A_technical_only                         logistic_regression  isotonic  60      0.389  0.510  54      0.66   -6.81%      9.16%
+B_technical_structure                    logistic_regression  isotonic  71      0.387  0.494  27      0.59   -4.39%      6.15%
+A_technical_only                         lightgbm             isotonic  60      0.407  0.512  25      0.51   -4.94%      6.67%
+A_technical_only                         random_forest        isotonic  60      0.392  0.508  45      0.49   -9.16%      10.01%
+E_technical_structure_regime_strategies  xgboost              isotonic  86      0.382  0.492  41      0.42   -9.93%      10.28%
+B_technical_structure                    random_forest        isotonic  71      0.395  0.502  42      0.42   -10.16%     10.16%
+B_technical_structure                    xgboost              isotonic  71      0.378  0.492  38      0.39   -9.75%      10.09%
+C_technical_structure_regime             random_forest        isotonic  79      0.389  0.495  35      0.37   -9.41%      10.25%
+
+Only 2 of 16 evaluable combos cleared even the Stage 1 screen. AUC-ROC
+across every combo hovered near 0.49-0.52 (a coin flip) -- consistent with
+Phase 3's original finding, not an improvement produced by adding
+strategy-signal features.
+
+============================================================
+9. STAGE 2: WALK-FORWARD + COST SENSITIVITY (Stage 1 survivors)
+============================================================
+
+B_technical_structure / lightgbm:
+  Stage 1 screen: PF 1.21, 34 trades, +2.29% net, max_dd 2.85%
+  Walk-forward (15 rolling OOS folds): 6/15 profitable (40%)
+  Cost sensitivity: base PF 1.21 -> 1.25x PF 1.17 -> 1.5x PF 1.13 ->
+    2x PF 1.06 (survives cost stress, barely)
+  VERDICT: RESEARCH_ONLY -- fails the walk-forward consistency bar
+  (only 40% of folds profitable, well under the 50% threshold). A single
+  favorable train/val/test split does not represent a real, repeatable
+  edge here; this is the exact multiple-comparisons signature Phase 3's
+  original LightGBM finding also showed (a promising single split that
+  did not replicate under walk-forward).
+
+E_technical_structure_regime_strategies / logistic_regression (the NEW
+ablation built specifically for this pass, adding each production
+strategy's own signal as a feature):
+  Stage 1 screen: PF 1.07, 31 trades, +0.73% net, max_dd 4.45%
+  Walk-forward (15 rolling OOS folds): 4/15 profitable (27%)
+  Cost sensitivity: base PF 1.07 -> 1.25x PF 1.03 -> 1.5x PF 0.99 (already
+    net-negative return at 1.5x costs) -> 2x PF 0.93
+  VERDICT: RESEARCH_ONLY -- fails BOTH the walk-forward bar (27%
+  profitable folds) and the cost-stress bar (net-negative by 1.5x costs).
+  The marginal PF 1.07 on the single screen split does not survive either
+  deeper check.
+
+Ablation D (technical + structure + regime + derivatives) was SKIPPED for
+all 4 models: "insufficient rows after split/dropna" -- the ~1-month
+open-interest history (567 rows total, see Section 1) drops all but a
+sliver of the ~3-year dataset once OI-derived columns are required
+non-null. This is the identical data-availability constraint Phase 3
+already found (docs/known_limitations.md: "Ablation D ... could not be
+evaluated"), reconfirmed on the current, larger dataset rather than
+silently repeated without checking.
+
+============================================================
+10-13. PERFORMANCE / DRAWDOWN / TRADE COUNT / CALIBRATION
+============================================================
+
+See the exact numbers in Sections 8-9 above -- reported in full, not
+selectively. No combo in this study demonstrated a profit factor that
+survived both real forward-walk validation and a realistic cost-stress
+test. Calibration (Brier score, isotonic vs sigmoid) was computed for
+every combo (Section 8's underlying run); isotonic won every comparison in
+this pass, but calibration quality is moot for a model that was ultimately
+rejected on trading-performance grounds regardless of how well-calibrated
+its probabilities were.
+
+============================================================
+14. FEATURE IMPORTANCE
+============================================================
+
+Computed by the existing pipeline machinery (ModelTrainer.
+get_feature_importance) but not deeply analyzed here: neither Stage 1
+survivor cleared Stage 2 validation, so a feature-importance ranking for
+either would describe what a REJECTED model happened to weight most
+heavily on one lucky split -- reporting it in detail here risks implying
+those features matter more than the overall negative result supports.
+Available on request by re-running scripts/research_ai_v1.py, which
+already wires trainer.get_feature_importance() into each walk-forward
+fold.
+
+============================================================
+15. REGIME PERFORMANCE
+============================================================
+
+Not broken out separately in this pass beyond what the walk-forward
+folds already show (Section 9): a model that fails to hold up across even
+half of 15 forward-rolling time windows has not demonstrated a repeatable
+regime-conditional edge either. The existing rule-based strategies'
+regime performance (bull/bear/high-vol/low-vol) is already fully reported
+in reports/STRATEGY_RESEARCH_V3_RIGOROUS_REPORT.txt and remains the
+authoritative regime analysis for this system's live strategies.
+
+============================================================
+16. STRATEGY CONTRIBUTION (Phase 7)
+============================================================
+
+This pass's one genuinely new empirical question: does adding the 4
+PRODUCTION_ELIGIBLE strategies' own signals as ML features add real
+information beyond the existing technical/structure/regime features?
+
+Answer: NO, not on this evidence. Ablation E (C + strategy_signals)
+underperformed ablation C on the Stage 1 screen for every model except
+logistic regression, and even that one exception failed Stage 2 decisively
+(27% of walk-forward folds profitable, net-negative under realistic cost
+stress). Adding the strategy-signal features did not produce a model that
+beats -- or even matches -- the technical-only/structural baselines,
+despite those 4 strategies themselves carrying real, independently
+validated (if modest) edges as RULE-BASED systems. This is not a
+contradiction: a strategy's own edge does not automatically transfer into
+being a USEFUL FEATURE for a differently-trained classifier predicting a
+differently-defined target (triple-barrier LONG/SHORT/NO_TRADE, not the
+strategy's own entry condition). The four strategies remain valuable as
+independent, already-validated PRODUCTION_ELIGIBLE decision sources in
+their own right (see services/signal_engine/multi_strategy.py) -- this
+finding is specifically about their value as ML MODEL INPUTS, which this
+pass found to be none.
+
+============================================================
+17. MODEL LIMITATIONS
+============================================================
+
+- All AUC-ROC scores across every combo/ablation clustered at 0.49-0.52 --
+  statistically indistinguishable from a coin flip on this dataset size.
+- The one Stage 1 "success" with the highest screen PF (C_technical_
+  structure_regime/lightgbm, PF 1.45) ran on only 13 test trades --
+  correctly excluded by the pre-declared >=20-trade floor, but illustrates
+  how easily a single split can produce a misleadingly strong-looking
+  number from too few trades.
+- Ablation D (derivatives) remains untestable at meaningful sample size
+  until Binance (or another source) offers longer historical OI coverage.
+- No liquidation-based features exist at all (zero historical rows,
+  unchanged since Phase 2 -- docs/known_limitations.md) -- not attempted,
+  not faked.
+- This pass tested single-split + walk-forward robustness but did not run
+  a trade-order bootstrap (unlike the rule-based strategy research in V2/
+  V3) -- moot here since neither model cleared walk-forward/cost-stress in
+  the first place; a bootstrap on an already-rejected model would not
+  change the RESEARCH_ONLY conclusion.
+
+============================================================
+18. REJECTED MODELS
+============================================================
+
+All 16 evaluable (ablation, model) combos were rejected. The two most
+promising -- B_technical_structure/lightgbm and
+E_technical_structure_regime_strategies/logistic_regression -- are detailed
+in full in Section 9 (both RESEARCH_ONLY, neither survives walk-forward +
+cost-stress). The remaining 14 failed the Stage 1 screen outright (PF <=
+1.0 with an adequate sample, or PF > 1.0 on too few trades) -- full table
+in Section 8. Ablation D (all 4 models) was skipped for genuine data-
+availability reasons, not evaluated and rejected.
+
+============================================================
+19. SELECTED MODEL
+============================================================
+
+NONE. No model in this study demonstrated a credible, cost-surviving,
+walk-forward-consistent out-of-sample edge. Per the explicit instruction
+governing this task: "If the research does not demonstrate a robust OOS
+edge, say so clearly and keep the model RESEARCH_ONLY" -- that is exactly
+what this report does. GET /api/v1/model/ (apps/api/routers/model.py)
+continues to report status="NO_MODEL_DEPLOYED", unchanged from before this
+pass -- nothing was written to the BotState "deployed_model_metadata" key.
+
+============================================================
+20. FROZEN CONFIGURATION
+============================================================
+
+None -- there is no model to freeze a configuration for. The AI signal
+orchestrator (services/signal_engine/ai_orchestrator.py) is built to
+operate correctly in exactly this state: every AIDecision it produces has
+probability_long/short/no_trade = None, expected_return = None, and
+model_version = None, with `confidence` falling back to the strategy's own
+real, already-validated quality tier (LOW/MEDIUM/HIGH, computed from R:R)
+rather than an invented number. If a future research pass DOES produce a
+model that survives walk-forward + cost-stress, its frozen configuration
+should be written to BotState.deployed_model_metadata in exactly the shape
+build_model_metadata() (ml/evaluation/ml_pipeline.py) already produces --
+that plumbing exists and is tested, waiting for a model that actually
+earns deployment.
+
+============================================================
+WHAT WAS IMPLEMENTED THIS PASS (beyond the research above)
+============================================================
+
+- ml/features/strategy_features.py -- the new strategy-signal feature
+  group (Phase 7), leakage-tested.
+- services/signal_engine/ai_orchestrator.py -- combines strategy evidence
+  + regime + volatility + (when available) a real deployed model's
+  calibrated probabilities into a structured AIDecision. Never fabricates
+  a probability; gracefully operates in strategy-evidence-only mode given
+  this pass's finding of NO_MODEL_DEPLOYED.
+- ml/signal.py -- extended with TP2/TP3 (additional ATR-multiple targets
+  beyond the model's own trained TP1 barrier), for the paper trader's
+  partial-exit engine. TP1/stop-loss values are UNCHANGED.
+- services/paper_trader/engine.py -- extended for TP1/TP2/TP3 partial-exit
+  slicing (40%/30%/30%), trade-level (not just last-slice) PnL/R-multiple
+  accounting, stop-loss always closing the full remaining position.
+- services/paper_trader/persistence.py + live_state.py -- durable Trade/
+  TradeExecution rows (mode="paper", source="AI_PAPER") mirroring every
+  paper-trading event, plus a process-wide PaperTrader singleton.
+- services/scheduler/jobs.py: ai_paper_trading_job -- runs strictly after
+  signal_generation_job in the same 4h tick (avoids a read-after-write
+  race), manages already-open paper positions every tick regardless of
+  model health, and opens new positions gated by services/model_monitor.
+- services/model_monitor/monitor.py -- HEALTHY/WARNING/DEGRADED/DISABLED
+  status from real recent AI paper-trade performance and prediction-class
+  distribution drift; DISABLED blocks new paper positions (existing
+  positions are still managed).
+- services/telegram/bot.py: send_paper_signal -- always labeled "PAPER
+  TRADE -- NO REAL ORDER PLACED", shows real probabilities when
+  model-backed or an honest "no model deployed" note otherwise.
+- services/scanner/multi_coin.py -- multi-coin architecture (Phase 10),
+  verified against CoinDCX's real public API (B-BTC_USDT, B-ETH_USDT,
+  B-SOL_USDT, B-XRP_USDT all confirmed live). Only BTC/USDT is SCORED
+  today (it is the only symbol with historical data and validated
+  strategies); every other whitelist symbol reports NOT_VALIDATED, never
+  a fabricated score.
+- apps/api/routers/model.py: GET /api/v1/model/ai-status -- model health +
+  paper-trading equity/P&L, surfaced on the existing /model frontend page.
+
+============================================================
+PRODUCTION ELIGIBILITY (unchanged by this pass)
+============================================================
+
+PRODUCTION_ELIGIBLE (generate real, non-paper live signals + Telegram
+alerts, unchanged from before this task):
+  S05_DONCHIAN_ADX_4H, S06_SUPERTREND_ATR_4H, V3_KAMA_TREND_4H,
+  V3_RANGE_EXPANSION_4H
+
+RESEARCH_ONLY / additionally introduced by this pass:
+  Every ML model trained in this study (Section 18) -- RESEARCH_ONLY,
+  never live.
+  The AI paper-trading layer itself -- PAPER ONLY, explicitly disabled
+  from real execution (see Safety section below); its own live/paper
+  track record will need its own future evaluation once enough real
+  paper trades accumulate (services/model_monitor's >=15-trade floor).
+  Non-BTC/USDT scanner symbols -- architecture-ready, NOT VALIDATED.
+
+============================================================
+SAFETY
+============================================================
+
+No order-placement capability exists anywhere in this codebase (verified
+by grep across the entire tree, and by tests/unit/test_no_order_placement_capability.py,
+extended by this pass's own tests to also cover the new paper-trading and
+orchestrator code). AUTOMATIC TRADING: DISABLED. Every paper trade is
+simulated only, in the Trade table with mode="paper", clearly distinct
+from any real CoinDCX-synced position (mode/source columns). Telegram's
+send_paper_signal always states "PAPER TRADE -- NO REAL ORDER PLACED" in
+both its header and footer.

@@ -113,6 +113,73 @@ class TelegramBot:
         )
         await self._send(text)
 
+    async def send_paper_signal(self, decision: dict):
+        """AI Trading V1, Phase 12: a qualifying AIDecision that the paper
+        trader has just opened a simulated position for. Distinct from
+        send_signal (rule-based strategy alerts) in three ways: it always
+        starts and ends with an explicit PAPER TRADE label, it never
+        implies a real order was or will be placed, and it surfaces the
+        AI evidence layer (probabilities when a real deployed model backs
+        the decision, regime, expected volatility) alongside the same
+        strategy-evidence fields send_signal already shows. Never fired
+        for every internal model evaluation -- only when the paper trader
+        actually opens a position (see services/scheduler/jobs.py:
+        ai_paper_trading_job)."""
+        if not self.enabled:
+            return
+        direction = decision.get("direction", "NO_TRADE")
+        if direction not in ("LONG", "SHORT"):
+            return
+        rate = await get_usdt_inr_rate()
+
+        def level(usdt_value):
+            usdt_line = format_usdt(usdt_value)
+            inr_line = format_inr(convert_usdt_to_inr(usdt_value, rate)) if rate is not None else "INR conversion unavailable"
+            return f"{usdt_line}\n≈ {inr_line}" if rate is not None else f"{usdt_line}\n({inr_line})"
+
+        emoji = "🟢" if direction == "LONG" else "🔴"
+        tp_lines = [f"TP1:\n{level(decision.get('take_profit_1'))}"]
+        if decision.get("take_profit_2") is not None:
+            tp_lines.append(f"TP2:\n{level(decision.get('take_profit_2'))}")
+        if decision.get("take_profit_3") is not None:
+            tp_lines.append(f"TP3:\n{level(decision.get('take_profit_3'))}")
+
+        model_status = decision.get("model_status", "NO_MODEL_DEPLOYED")
+        if model_status == "MODEL_BACKED":
+            prob_line = (
+                f"AI Probability (LONG / SHORT / NO_TRADE):\n"
+                f"{decision.get('probability_long', 0):.0%} / {decision.get('probability_short', 0):.0%} / "
+                f"{decision.get('probability_no_trade', 0):.0%}\n"
+                f"Model: {decision.get('model_version', 'unknown')}\n"
+            )
+        else:
+            prob_line = (
+                "AI Model:\nNo validated model is currently deployed -- this decision is backed by "
+                "strategy evidence only (see reports/AI_TRADING_RESEARCH_V1.txt).\n"
+            )
+
+        vol = decision.get("expected_volatility")
+        vol_line = f"{vol:.2%}" if vol is not None else "n/a"
+
+        text = (
+            f"📝 PAPER TRADE -- NO REAL ORDER PLACED\n\n"
+            f"Strategy Sources:\n{', '.join(decision.get('strategy_sources', []))}\n\n"
+            f"Coin / Market:\n{decision.get('symbol', 'BTC/USDT')} -- {decision.get('market', 'CoinDCX BTC/USDT Perpetual')}\n"
+            f"Timeframe:\n{decision.get('timeframe', '4h')}\n\n"
+            f"{emoji} {direction}\n\n"
+            f"Confidence:\n{decision.get('confidence', 'LOW')}\n\n"
+            f"{prob_line}\n"
+            f"Expected Volatility (ATR/close):\n{vol_line}\n\n"
+            f"Market Regime:\n{decision.get('regime', 'UNCERTAIN')}\n\n"
+            f"Entry:\n{level(decision.get('entry'))}\n\n"
+            f"Stop Loss:\n{level(decision.get('stop_loss'))}\n\n"
+            + "\n\n".join(tp_lines) + "\n\n"
+            f"Risk/Reward:\n1 : {decision.get('risk_reward', 0)}\n\n"
+            f"PAPER TRADE -- NO REAL ORDER PLACED. AlphaOne does not place live orders; "
+            f"automatic trading remains disabled."
+        )
+        await self._send(text)
+
     async def send_position_detected(self, position: dict):
         """Sent when a new CoinDCX position is detected during sync
         (Phase 5 section 27) -- purely informational, AlphaOne did not

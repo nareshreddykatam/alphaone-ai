@@ -17,6 +17,7 @@ from services.exchange.coindcx import CoinDCXMarketDataProvider, CoinDCXReadOnly
 from services.market_data.coindcx_ws import CoinDCXMarketDataWebSocket
 from services.market_data.live_state import _StartupRetrySupervisor
 from services.signal_engine.live_breakout import LiveCandleAggregator
+from services.paper_trader.engine import PaperTrader
 
 FORBIDDEN_SUBSTRINGS = (
     "place_order", "create_order", "submit_order", "send_order",
@@ -149,6 +150,52 @@ def test_live_candle_aggregator_takes_no_credentials_and_has_no_exchange_calls()
     assert "api_secret" not in signature.parameters
     method_names = _all_public_method_names(LiveCandleAggregator)
     assert set(method_names) == {"on_tick"}
+
+
+def test_ai_trading_v1_modules_expose_no_order_mutating_function_or_method():
+    """AI Trading V1: the new AI orchestrator, paper-trading engine, model
+    monitor, and multi-coin scanner must all pass the exact same
+    forbidden-substring scan as every pre-existing exchange class --
+    "paper trading" must never quietly grow a real order-placement path."""
+    import services.paper_trader.engine as paper_engine_module
+    import services.paper_trader.persistence as paper_persistence_module
+    import services.signal_engine.ai_orchestrator as orchestrator_module
+    import services.model_monitor.monitor as monitor_module
+    import services.scanner.multi_coin as scanner_module
+    import services.scheduler.jobs as jobs_module
+
+    modules = [
+        paper_engine_module, paper_persistence_module, orchestrator_module,
+        monitor_module, scanner_module, jobs_module,
+    ]
+    classes = [PaperTrader]
+
+    for module in modules:
+        function_names = [
+            name for name, obj in inspect.getmembers(module, predicate=inspect.isfunction)
+            if not name.startswith("_") and obj.__module__ == module.__name__
+        ]
+        for name in function_names:
+            lowered = name.lower()
+            for forbidden in FORBIDDEN_SUBSTRINGS:
+                assert forbidden not in lowered, f"{module.__name__}.{name} looks like an order-mutating function"
+
+    for cls in classes:
+        for name in _all_public_method_names(cls):
+            lowered = name.lower()
+            for forbidden in FORBIDDEN_SUBSTRINGS:
+                assert forbidden not in lowered, f"{cls.__name__}.{name} looks like an order-mutating method"
+
+
+def test_paper_trader_never_imports_a_real_exchange_order_client():
+    """The paper-trading engine must never import anything from
+    services.exchange.coindcx beyond what read-only market context needs
+    -- it should have NO import of that module at all, since paper trading
+    never needs to talk to the real exchange."""
+    import services.paper_trader.engine as paper_engine_module
+    source = inspect.getsource(paper_engine_module)
+    assert "services.exchange.coindcx" not in source
+    assert "import httpx" not in source  # no direct network calls from the paper engine
 
 
 def test_live_breakout_job_and_evaluator_are_read_only_by_name():

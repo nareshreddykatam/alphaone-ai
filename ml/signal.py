@@ -78,17 +78,32 @@ def make_ml_signal_func(
         if best_side is None:
             return None  # NO_TRADE is a valid, expected, frequent output
 
+        # TP1 stays EXACTLY the barrier the label/model were trained against
+        # (tp_atr_multiple * ATR) -- this is what makes the backtest's TP1
+        # fill actually test what the model predicted, per the module
+        # docstring. TP2/TP3 are additional, more ambitious ATR-multiples
+        # beyond that trained barrier (1.5x / 2x it) -- used only by the
+        # paper-trading partial-exit engine (services/paper_trader/engine.py),
+        # never by Backtester.run() itself, which only ever fills TP1 (see
+        # docs/known_limitations.md: "No partial exits or TP2/TP3 modeling
+        # in the backtester"). They are extrapolated risk-multiples, not
+        # independently validated barriers -- documented as such wherever
+        # they're surfaced (Telegram, paper trades).
+        sign = 1 if best_side == "LONG" else -1
         if best_side == "LONG":
             stop = entry_price - barrier_config.sl_atr_multiple * atr_val
-            target = entry_price + barrier_config.tp_atr_multiple * atr_val
         else:
             stop = entry_price + barrier_config.sl_atr_multiple * atr_val
-            target = entry_price - barrier_config.tp_atr_multiple * atr_val
+        target_1 = entry_price + sign * barrier_config.tp_atr_multiple * atr_val
+        target_2 = entry_price + sign * barrier_config.tp_atr_multiple * 1.5 * atr_val
+        target_3 = entry_price + sign * barrier_config.tp_atr_multiple * 2.0 * atr_val
 
         return {
             "signal_type": best_side,
             "stop_loss": stop,
-            "take_profit_1": target,
+            "take_profit_1": target_1,
+            "take_profit_2": target_2,
+            "take_profit_3": target_3,
             "leverage": signal_config.leverage,
             "long_probability": long_p,
             "short_probability": short_p,

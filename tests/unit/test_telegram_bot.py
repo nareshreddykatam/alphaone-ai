@@ -257,3 +257,74 @@ async def test_no_command_handler_name_suggests_order_placement():
     for name in handler_names:
         for term in forbidden_terms:
             assert term not in name.lower()
+
+
+@pytest.mark.asyncio
+async def test_send_paper_signal_always_labels_paper_trade_no_real_order(monkeypatch):
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    bot.enabled = True
+    sent = {}
+
+    async def fake_send(text):
+        sent["text"] = text
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    monkeypatch.setattr("services.telegram.bot.get_usdt_inr_rate", AsyncMock(return_value=None))
+
+    await bot.send_paper_signal({
+        "symbol": "BTC/USDT", "market": "CoinDCX BTC/USDT Perpetual", "timeframe": "4h",
+        "strategy_sources": ["S06_SUPERTREND_ATR_4H"], "direction": "LONG",
+        "probability_long": None, "probability_short": None, "probability_no_trade": None,
+        "expected_return": None, "expected_volatility": 0.021, "regime": "TRENDING_BULLISH",
+        "confidence": "MEDIUM", "entry": 80000.0, "stop_loss": 78000.0,
+        "take_profit_1": 84000.0, "take_profit_2": None, "take_profit_3": None,
+        "risk_reward": 2.0, "model_status": "NO_MODEL_DEPLOYED", "model_version": None,
+    })
+    text = sent["text"]
+    assert "PAPER TRADE -- NO REAL ORDER PLACED" in text
+    assert text.count("PAPER TRADE -- NO REAL ORDER PLACED") == 2  # header AND footer
+    assert "S06_SUPERTREND_ATR_4H" in text
+    assert "No validated model is currently deployed" in text
+    assert "AlphaOne does not place orders" not in text  # that's send_signal's exact wording; just checking no crash-induced garble
+    assert "$" in text or "80,000" in text or "80000" in text  # entry level actually rendered
+
+
+@pytest.mark.asyncio
+async def test_send_paper_signal_shows_real_probabilities_when_model_backed(monkeypatch):
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    bot.enabled = True
+    sent = {}
+
+    async def fake_send(text):
+        sent["text"] = text
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    monkeypatch.setattr("services.telegram.bot.get_usdt_inr_rate", AsyncMock(return_value=None))
+
+    await bot.send_paper_signal({
+        "symbol": "BTC/USDT", "market": "CoinDCX BTC/USDT Perpetual", "timeframe": "4h",
+        "strategy_sources": ["S06_SUPERTREND_ATR_4H"], "direction": "LONG",
+        "probability_long": 0.62, "probability_short": 0.13, "probability_no_trade": 0.25,
+        "expected_return": 0.3, "expected_volatility": 0.021, "regime": "TRENDING_BULLISH",
+        "confidence": "62% calibrated probability", "entry": 80000.0, "stop_loss": 78000.0,
+        "take_profit_1": 84000.0, "take_profit_2": 86000.0, "take_profit_3": 88000.0,
+        "risk_reward": 2.0, "model_status": "MODEL_BACKED", "model_version": "lightgbm_v1",
+    })
+    text = sent["text"]
+    assert "62%" in text
+    assert "lightgbm_v1" in text
+    assert "TP2" in text and "TP3" in text
+
+
+@pytest.mark.asyncio
+async def test_send_paper_signal_is_noop_for_no_trade_direction(monkeypatch):
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    bot.enabled = True
+    called = {"count": 0}
+
+    async def fake_send(text):
+        called["count"] += 1
+
+    monkeypatch.setattr(bot, "_send", fake_send)
+    await bot.send_paper_signal({"direction": "NO_TRADE"})
+    assert called["count"] == 0

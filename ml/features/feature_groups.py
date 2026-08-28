@@ -11,6 +11,7 @@ extended to these additions.
 import numpy as np
 import pandas as pd
 
+from ml.features.strategy_features import assemble_strategy_features
 from services.feature_engine.engine import FeatureEngine
 from services.signal_engine.regime import detect_regime_series, MarketRegimeDetector
 
@@ -60,6 +61,17 @@ _GROUP_DEFINITIONS: dict[str, list[str]] = {
         # a fabricated one.
     ],
     "context_1h": [f"{CONTEXT_PREFIX}{c}" for c in CONTEXT_1H_COLUMNS],
+    # AI Trading V1, Phase 7: each PRODUCTION_ELIGIBLE rule-based strategy's
+    # own LONG/SHORT/NO_TRADE output as a feature, plus simple consensus
+    # aggregates -- see ml/features/strategy_features.py. Only populated
+    # when assemble_features(..., include_strategy_signals=True) is used;
+    # otherwise this group is empty (filtered out by get_feature_groups
+    # against whatever columns actually exist).
+    "strategy_signals": [
+        "strat_S05_DONCHIAN_ADX_4H", "strat_S06_SUPERTREND_ATR_4H",
+        "strat_V3_KAMA_TREND_4H", "strat_V3_RANGE_EXPANSION_4H",
+        "strat_net_direction", "strat_agree_long", "strat_agree_short",
+    ],
 }
 
 ABLATION_CONFIGS: dict[str, list[str]] = {
@@ -68,6 +80,15 @@ ABLATION_CONFIGS: dict[str, list[str]] = {
     "C_technical_structure_regime": ["trend", "momentum", "volatility", "volume", "structure", "regime"],
     "D_technical_structure_regime_derivatives": [
         "trend", "momentum", "volatility", "volume", "structure", "regime", "derivatives",
+    ],
+    # AI Trading V1: does the existing validated strategy registry's own
+    # output add anything a technical/structure/regime model doesn't
+    # already have access to? Deliberately built on C (not D) -- combining
+    # with the sparse ~1-month derivatives data would confound the two
+    # additions' individual effect, and Phase 3 already found derivatives
+    # unusable at this sample size (docs/known_limitations.md).
+    "E_technical_structure_regime_strategies": [
+        "trend", "momentum", "volatility", "volume", "structure", "regime", "strategy_signals",
     ],
 }
 # context_1h is added to every ablation model (see module docstring) -- it's
@@ -127,12 +148,15 @@ def assemble_features(
     df_context: pd.DataFrame | None = None,
     funding_rates: pd.DataFrame | None = None,
     open_interest: pd.DataFrame | None = None,
+    include_strategy_signals: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Builds the full Phase 3 feature set on the primary (4h) timeframe.
 
     Returns (assembled_df, feature_names) where feature_names is every
     column produced by the feature engine plus this module's additions
-    (regime one-hot, derived trend/ATR% columns, 1h context) -- NOT
+    (regime one-hot, derived trend/ATR% columns, 1h context, and -- only
+    when `include_strategy_signals=True` -- each production-eligible
+    strategy's own signal, see ml/features/strategy_features.py) -- NOT
     filtered to any particular ablation group; use `select_features()` for
     that.
     """
@@ -147,6 +171,9 @@ def assemble_features(
     else:
         for c in CONTEXT_1H_COLUMNS:
             df[f"{CONTEXT_PREFIX}{c}"] = np.nan
+
+    if include_strategy_signals:
+        df, _ = assemble_strategy_features(df)
 
     feature_names = [c for c in df.columns if c not in (
         "timestamp", "open", "high", "low", "close", "volume", "symbol", "timeframe",

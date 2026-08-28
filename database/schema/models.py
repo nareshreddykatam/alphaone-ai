@@ -39,6 +39,7 @@ class TradeSource(str, enum.Enum):
     MANUAL = "MANUAL"
     SUNCRYPTO_SYNC = "SUNCRYPTO_SYNC"  # Phase 4, kept for historical rows -- no longer the active exchange
     COINDCX_SYNC = "COINDCX_SYNC"
+    AI_PAPER = "AI_PAPER"  # AI Trading V1: opened by services/signal_engine/ai_orchestrator.py + services/paper_trader, never a real fill
 
 
 class SignalQuality(str, enum.Enum):

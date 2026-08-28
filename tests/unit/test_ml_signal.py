@@ -65,6 +65,11 @@ def test_long_signal_emitted_when_both_threshold_and_ev_satisfied():
     assert signal["signal_type"] == "LONG"
     assert signal["stop_loss"] == pytest.approx(90.0)   # entry - 1*ATR
     assert signal["take_profit_1"] == pytest.approx(120.0)  # entry + 2*ATR
+    # AI Trading V1: TP2/TP3 are additional, more ambitious ATR-multiples
+    # beyond TP1 -- TP1 itself must stay EXACTLY the trained barrier (the
+    # assertion above), never shifted to make room for TP2/TP3.
+    assert signal["take_profit_2"] == pytest.approx(130.0)  # entry + 3*ATR (1.5x the 2.0 barrier)
+    assert signal["take_profit_3"] == pytest.approx(140.0)  # entry + 4*ATR (2.0x the 2.0 barrier)
 
 
 def test_short_signal_uses_mirrored_barriers():
@@ -76,6 +81,8 @@ def test_short_signal_uses_mirrored_barriers():
     assert signal["signal_type"] == "SHORT"
     assert signal["stop_loss"] == pytest.approx(110.0)
     assert signal["take_profit_1"] == pytest.approx(80.0)
+    assert signal["take_profit_2"] == pytest.approx(70.0)
+    assert signal["take_profit_3"] == pytest.approx(60.0)
 
 
 def test_no_trade_dominant_class_produces_no_signal():

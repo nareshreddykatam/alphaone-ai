@@ -26,6 +26,7 @@ async def test_scheduler_health_endpoint_returns_expected_shape(client):
     assert set(body["jobs"].keys()) == {
         "account_sync", "exit_alerts", "signal_generation", "signal_generation_15m",
         "outcome_evaluation", "candle_ingestion", "live_breakout",
+        "ai_paper_trading",  # AI Trading V1 -- runs inline after signal_generation, see runner.py
     }
     for job in body["jobs"].values():
         assert set(job.keys()) == {"last_tick_at", "seconds_since_last_tick", "circuit_state", "consecutive_failures"}

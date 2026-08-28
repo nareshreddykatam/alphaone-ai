@@ -39,7 +39,7 @@ from services.market_data.live_state import market_ws, live_candle_aggregators
 from services.scheduler.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from services.scheduler.jobs import (
     account_sync_job, exit_alert_job, signal_generation_job, outcome_evaluation_job, candle_ingestion_job,
-    live_breakout_job,
+    live_breakout_job, ai_paper_trading_job,
 )
 
 logger = structlog.get_logger()
@@ -75,6 +75,7 @@ class SchedulerRunner:
         self.outcome_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.candle_ingestion_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         self.live_breakout_breaker = CircuitBreaker(config=CircuitBreakerConfig())
+        self.ai_paper_trading_breaker = CircuitBreaker(config=CircuitBreakerConfig())
         # The SHARED, process-wide 4h forming-candle aggregator (services/
         # market_data/live_state.py's registry -- not a private instance)
         # -- so the Live Chart (apps/api/routers/market.py) and this
@@ -133,6 +134,26 @@ class SchedulerRunner:
         try:
             async with async_session() as session:
                 await signal_generation_job(session, timeframe="4h")
+                # AI Trading V1: runs strictly AFTER signal_generation_job's
+                # own commit, in the same tick -- reads back the Signal rows
+                # it just persisted, so this must never be its own
+                # independently-scheduled loop (see ai_paper_trading_job's
+                # own docstring for why). Guarded by its own breaker so a
+                # paper-trading failure can never affect the 4h strategy
+                # signal path's own breaker/schedule.
+                if self.ai_paper_trading_breaker.can_attempt():
+                    try:
+                        opened = await ai_paper_trading_job(session, timeframe="4h")
+                        self.ai_paper_trading_breaker.record_success()
+                        if opened:
+                            from dataclasses import asdict
+                            from services.telegram.bot import TelegramBot
+                            bot = TelegramBot()
+                            for decision in opened:
+                                await bot.send_paper_signal(asdict(decision))
+                    except Exception as e:
+                        self.ai_paper_trading_breaker.record_failure()
+                        logger.error("ai_paper_trading_job failed", error=str(e))
             self.signal_breaker.record_success()
         except Exception as e:
             self.signal_breaker.record_failure()
@@ -239,6 +260,17 @@ class SchedulerRunner:
                 "circuit_state": breaker.state.value,
                 "consecutive_failures": breaker.consecutive_failures,
             }
+        # ai_paper_trading_job has no _loop/interval of its own -- it runs
+        # inline, strictly after signal_generation_job, within the SAME
+        # tick (see run_once_signal_generation) -- so it shares that tick's
+        # timestamp rather than stamping a separate one.
+        signal_tick = self._last_tick_at.get("signal_generation")
+        jobs["ai_paper_trading"] = {
+            "last_tick_at": signal_tick.isoformat() if signal_tick else None,
+            "seconds_since_last_tick": (now - signal_tick).total_seconds() if signal_tick else None,
+            "circuit_state": self.ai_paper_trading_breaker.state.value,
+            "consecutive_failures": self.ai_paper_trading_breaker.consecutive_failures,
+        }
         return {"scheduler_running": self._running, "jobs": jobs}
 
     def start(self) -> None:
