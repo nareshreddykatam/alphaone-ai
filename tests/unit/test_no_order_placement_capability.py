@@ -289,6 +289,87 @@ def test_paper_trader_never_imports_a_real_exchange_order_client():
     assert "import httpx" not in source  # no direct network calls from the paper engine
 
 
+def test_live_execution_modules_expose_no_order_mutating_function_or_method():
+    """Live Futures Auto-Trading V1: every services/live_execution/* module
+    and the read-only status router must pass the exact same forbidden-
+    substring scan as every pre-existing exchange/paper-trading module --
+    building the real safety architecture must never introduce a real
+    order-mutating capability by accident."""
+    import services.live_execution.kill_switch as kill_switch_module
+    import services.live_execution.idempotency as idempotency_module
+    import services.live_execution.gates as gates_module
+    import services.live_execution.order_client as order_client_module
+    import services.live_execution.executor as executor_module
+    import services.live_execution.reconciliation as reconciliation_module
+    import services.live_execution.daily_loss as daily_loss_module
+    import apps.api.routers.live_execution_status as status_module
+
+    modules = [
+        kill_switch_module, idempotency_module, gates_module, order_client_module,
+        executor_module, reconciliation_module, daily_loss_module, status_module,
+    ]
+    for module in modules:
+        function_names = [
+            name for name, obj in inspect.getmembers(module, predicate=inspect.isfunction)
+            if not name.startswith("_") and obj.__module__ == module.__name__
+        ]
+        for name in function_names:
+            if name == "submit_futures_order":
+                continue  # the one function that WOULD submit an order -- always raises, see its own test coverage below
+            lowered = name.lower()
+            for forbidden in FORBIDDEN_SUBSTRINGS:
+                assert forbidden not in lowered, f"{module.__name__}.{name} looks like an order-mutating function"
+
+
+def test_order_client_submit_futures_order_always_raises_and_never_makes_a_network_call():
+    """The one function in this codebase capable of reaching a real order
+    endpoint must be structurally incapable of doing so today: it must
+    always raise, unconditionally, and its source must contain no HTTP
+    client call of any kind."""
+    from services.live_execution.order_client import submit_futures_order, OrderContractNotVerifiedError
+    source = inspect.getsource(submit_futures_order)
+    for forbidden in ("httpx", "requests.", ".post(", ".get(", "aiohttp"):
+        assert forbidden not in source
+    with pytest.raises(OrderContractNotVerifiedError):
+        submit_futures_order(instrument="B-BTC_USDT", side="buy", quantity=0.001, leverage=10)
+
+
+def test_live_execution_gates_module_never_imports_a_real_order_client():
+    import services.live_execution.gates as gates_module
+    source = inspect.getsource(gates_module)
+    assert "services.exchange.coindcx" not in source
+    assert "submit_futures_order" not in source
+
+
+def test_live_execution_status_router_is_read_only_and_never_imports_order_client():
+    """GET /api/v1/live-execution/status must remain pure observability --
+    must never import the order-submission function and must define no
+    POST/PUT/PATCH/DELETE handler."""
+    import apps.api.routers.live_execution_status as status_module
+    source = inspect.getsource(status_module)
+    assert "submit_futures_order" not in source
+    assert "services.exchange.coindcx" not in source
+    for forbidden in ("@router.post", "@router.put", "@router.patch", "@router.delete"):
+        assert forbidden not in source
+
+
+def test_live_execution_executor_only_place_that_imports_the_order_client():
+    """Confirms the order-submission function is wired into exactly the
+    one place the architecture intends (the executor's terminal step,
+    itself gated by ORDER_CONTRACT_VERIFIED which can never pass) -- not
+    duplicated or reachable from the Telegram pipeline, the scanner, or
+    any router."""
+    import services.telegram_signals.pipeline as pipeline_module
+    import services.telegram_signals.paper_execution as tg_execution_module
+    import services.scanner.multi_coin as scanner_module
+    import apps.api.routers.live_execution_status as status_module
+
+    for module in (pipeline_module, tg_execution_module, scanner_module, status_module):
+        source = inspect.getsource(module)
+        assert "submit_futures_order" not in source
+        assert "services.live_execution.order_client" not in source
+
+
 def test_live_breakout_job_and_evaluator_are_read_only_by_name():
     """services/signal_engine/live_breakout.py's module-level functions
     must also pass the same forbidden-substring scan as every exchange

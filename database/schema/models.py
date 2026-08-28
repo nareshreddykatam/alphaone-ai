@@ -588,3 +588,71 @@ class ExternalSignal(Base):
     __table_args__ = (
         Index("ix_external_signals_message_id", "message_id"),
     )
+
+
+class LiveExecutionStatus(str, enum.Enum):
+    """Live Futures Auto-Trading V1: the full audit trail every execution
+    candidate moves through (Phase 25). A row is created at RECEIVED and
+    updated in place through every subsequent stage -- never deleted, so
+    the complete history of every decision (including every REJECTED one
+    and exactly why) survives forever."""
+    RECEIVED = "RECEIVED"
+    PARSED = "PARSED"
+    VALIDATED = "VALIDATED"
+    RISK_APPROVED = "RISK_APPROVED"
+    EXECUTION_ATTEMPTED = "EXECUTION_ATTEMPTED"
+    EXCHANGE_ACCEPTED = "EXCHANGE_ACCEPTED"
+    FILLED = "FILLED"
+    POSITION_OPEN = "POSITION_OPEN"
+    PARTIAL_EXIT = "PARTIAL_EXIT"
+    CLOSED = "CLOSED"
+    REJECTED = "REJECTED"
+
+
+class LiveExecutionSource(str, enum.Enum):
+    ALPHAONE_STRATEGY = "ALPHAONE_STRATEGY"
+    ALPHAONE_AI = "ALPHAONE_AI"
+    TELEGRAM_EXTERNAL = "TELEGRAM_EXTERNAL"
+
+
+class LiveExecution(Base):
+    """Live Futures Auto-Trading V1: the single durable record every real-
+    money execution candidate is tracked through, from the moment a
+    signal is considered until the position (if any) closes. This table
+    IS the idempotency mechanism (Phase 10-11): `idempotency_key` is
+    unique at the DATABASE level, so two workers racing to process the
+    exact same signal can never both create a row -- the second insert
+    fails with a real IntegrityError, which the caller treats as "already
+    being handled", never as a reason to retry a real order. Never
+    deleted; REJECTED rows are kept exactly like successful ones, with
+    their reason, so nothing is ever silently discarded (Phase 25)."""
+    __tablename__ = "live_executions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    idempotency_key = Column(String(200), nullable=False)
+    source = Column(String(30), nullable=False)
+    signal_id = Column(String(64), nullable=True)
+    symbol = Column(String(20), nullable=False)
+    instrument = Column(String(40), nullable=True)
+    direction = Column(String(10), nullable=False)
+    status = Column(String(30), nullable=False, default=LiveExecutionStatus.RECEIVED.value)
+    rejection_reason = Column(Text, nullable=True)
+    gate_results = Column(JSON, nullable=True)  # per-gate PASS/FAIL snapshot at the moment of the decision -- never a credential
+    margin_inr = Column(Float, nullable=True)
+    leverage = Column(Integer, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    take_profit_1 = Column(Float, nullable=True)
+    take_profit_2 = Column(Float, nullable=True)
+    take_profit_3 = Column(Float, nullable=True)
+    quantity = Column(Float, nullable=True)
+    exchange_order_id = Column(String(64), nullable=True)
+    exchange_status = Column(String(30), nullable=True)
+    trade_id = Column(String(30), nullable=True)  # linked Trade row once a real position is confirmed open
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_live_executions_idempotency_key", "idempotency_key", unique=True),
+        Index("ix_live_executions_status", "status"),
+    )

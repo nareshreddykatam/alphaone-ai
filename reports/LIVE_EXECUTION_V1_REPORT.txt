@@ -1,0 +1,345 @@
+============================================================
+ALPHAONE AI -- LIVE FUTURES AUTO-TRADING V1
+SAFE EXECUTION LAYER IMPLEMENTATION
+============================================================
+
+REAL ORDERS PLACED THIS PHASE: 0
+AUTOMATIC TRADING: DISABLED (production default, unchanged)
+DEPLOYED: NO
+
+============================================================
+1. WHY THIS PHASE INTENTIONALLY STOPS SHORT OF LIVE TRADING
+============================================================
+
+Two facts, confirmed by direct source audit (not assumption), make real
+order submission impossible to build safely in this pass:
+
+  1. CoinDCX's real futures order-creation request contract is
+     unverified. docs/coindcx_api_findings.md documents that
+     POST /exchange/v1/derivatives/futures/orders/create EXISTS as a path,
+     but not its request body: the order_type enum, side/position-side
+     semantics, how leverage is set per-order vs. per-position, whether/how
+     native SL/TP attachment works, or the client-order-ID field name for
+     idempotency. Nothing in this repository has ever exercised this
+     endpoint against a real account.
+
+  2. Per-instrument execution precision is not captured anywhere in this
+     codebase: quantity step, minimum quantity, minimum notional, and
+     price precision for CoinDCX USDT futures instruments. Section 8 of
+     this task's own spec requires position sizing to be rounded to the
+     EXACT instrument's precision and then re-verified against the exact
+     Rs.200 margin rule -- that cannot be done honestly without real
+     instrument-details data this system has never fetched.
+
+Per this task's own explicit instruction ("if something cannot be safely
+determined, leave live execution disabled and document exactly what
+remains unknown"), the decision this phase makes is: build the ENTIRE
+surrounding safety architecture for real -- gating, idempotency, audit
+logging, kill switch, reconciliation, daily loss limit -- while making the
+actual order-submission call permanently and unconditionally impossible,
+via two independent mechanisms (see Section 3).
+
+============================================================
+2. WHAT WAS BUILT
+============================================================
+
+database/schema/models.py
+  - LiveExecutionStatus, LiveExecutionSource enums.
+  - LiveExecution model: the single durable record every real-money
+    candidate is tracked through (RECEIVED -> PARSED -> VALIDATED ->
+    RISK_APPROVED -> EXECUTION_ATTEMPTED -> EXCHANGE_ACCEPTED -> FILLED ->
+    POSITION_OPEN -> PARTIAL_EXIT -> CLOSED, or REJECTED with a reason at
+    any point). idempotency_key has a UNIQUE index at the database level --
+    this IS the idempotency/race-protection mechanism, not just an
+    application-level check.
+
+apps/api/config.py
+  - automatic_trading_enabled: bool = False
+  - live_execution_armed: bool = False
+  - max_open_positions_live: int = 1
+  All default to the safe/off state; none are settable via Telegram,
+  strategy, AI, API, or frontend input -- only real environment variables
+  or direct monkeypatching in tests can change them.
+
+services/live_execution/kill_switch.py
+  - Durable emergency stop backed by the existing BotState table (same
+    table used for deployed_model_metadata) -- survives process/Railway/
+    scheduler restarts. NO HTTP write endpoint exists anywhere for this;
+    activation/clearing is only reachable via direct Python function calls
+    from a trusted context, never a request handler.
+
+services/live_execution/idempotency.py
+  - compute_idempotency_key(): deterministic key from source + symbol +
+    signal_id (or a source+symbol+strategy+candle-timestamp composite
+    fallback) -- same real-world signal always produces the same key,
+    regardless of restart, reconnect, or retry.
+
+services/live_execution/gates.py
+  - The multi-gate safety check. Every gate is evaluated and recorded even
+    after an earlier one fails (a full audit snapshot per candidate, never
+    short-circuited). Gates: AUTOMATIC_TRADING_ENABLED, LIVE_EXECUTION_ARMED,
+    EMERGENCY_STOP_CLEAR, MARKET_DATA_HEALTHY, COINDCX_ACCOUNT_HEALTHY,
+    INSTRUMENT_ELIGIBLE, SIGNAL_FRESH (<=300s old), VALID_SL, VALID_TP,
+    POSITION_LIMIT_OK, DAILY_LOSS_LIMIT_OK, RISK_ENGINE_APPROVED (reuses
+    the existing services/risk_engine/fixed_margin.py -- Rs.200 margin,
+    exactly 10x leverage, real USDT/INR rate required), DAILY_LIMIT_NOT_
+    EXCEEDED (reuses the same 15/day hard max), and ORDER_CONTRACT_VERIFIED
+    -- a constant, permanently False, documented in-line as to why. Approval
+    requires every single gate to pass.
+
+services/live_execution/order_client.py
+  - submit_futures_order(): the ONE function in this codebase capable of
+    reaching a real CoinDCX order endpoint. It always raises
+    OrderContractNotVerifiedError, unconditionally, regardless of
+    arguments -- makes no HTTP request at all (confirmed by source
+    inspection: no httpx/requests/aiohttp import or call anywhere in the
+    function). This mirrors the existing project pattern where
+    CoinDCXReadOnlyAccountProvider has no order-placement METHOD AT ALL --
+    the strongest guarantee available, "the capability does not exist",
+    not "returns an error".
+
+services/live_execution/executor.py
+  - process_live_execution_candidate(): the single entry point. Computes
+    the idempotency key, checks for an existing row first (fast path for
+    a genuine duplicate), inserts a new RECEIVED row, and relies on the
+    database's own unique constraint to reject a losing concurrent insert
+    (IntegrityError -> defer to the winner's row, never retry). Runs the
+    full gate check, records the gate snapshot, and stops at REJECTED
+    with an explicit reason unless every gate passes -- which, today,
+    never happens, because ORDER_CONTRACT_VERIFIED can never pass.
+
+services/live_execution/daily_loss.py
+  - check_daily_loss_limit(): reuses the EXISTING RiskConfig.max_daily_
+    loss_pct (2.0%, services/risk_engine/engine.py) applied against REAL
+    CoinDCX account equity (read-only get_balance()) rather than a
+    notional figure. No equity available -> blocked, never assumed safe.
+
+services/live_execution/reconciliation.py
+  - reconcile_positions(): read-only comparison of local POSITION_OPEN/
+    PARTIAL_EXIT rows against CoinDCX's real get_open_positions().
+    Reports UNEXPECTED_OPEN_POSITION, MISSING_POSITION, SIDE_MISMATCH,
+    and QUANTITY_MISMATCH -- never silently resolves a discrepancy either
+    direction. An exchange-read failure is reported as checked_at_ok=False,
+    never treated as "everything matches".
+
+apps/api/routers/live_execution_status.py (GET /api/v1/live-execution/status)
+  - Read-only observability: automatic_trading (DISABLED/ARMED/ACTIVE --
+    ACTIVE is structurally unreachable today), order_contract_verified,
+    emergency_stop (ACTIVE/CLEAR) with reason, daily_entries (count/
+    target/max), margin_inr, leverage, max_open_positions_live,
+    open_positions_live. No POST/PUT/PATCH/DELETE handler exists on this
+    router. No credential value is ever included in the response.
+
+services/telegram/bot.py
+  - send_live_order_submitted() / send_live_order_filled(): notification
+    methods for the two user-facing alert stages this spec requires.
+    Neither is wired to fire yet, since no candidate ever reaches a state
+    where they would legitimately be needed (see Section 6, gap #1).
+
+Bug fix (found via live server verification, not a unit test):
+  services/telegram_mtproto/client.py's is_running() previously reported
+  False immediately after a healthy, successful connection, because
+  _run() deliberately returns once connected (Telethon's own client keeps
+  receiving independently from there) -- a naive task.done() check
+  misread this as "not running". Fixed to fall back to is_connected()
+  once the task is done. Verified against the REAL, LIVE MTProto
+  connection to @suncrypto_trading_alerts (a real local uvicorn run,
+  not a mock) before and after the fix. 2 regression tests added.
+
+============================================================
+3. DEFENSE IN DEPTH -- WHY "ARMED" CAN NEVER BECOME A REAL ORDER
+============================================================
+
+Two independent mechanisms, so a bug in either one alone cannot cause a
+real order:
+
+  (a) gates.py's ORDER_CONTRACT_VERIFIED gate: a module-level constant,
+      hardcoded False, checked as the LAST gate in check_all_live_
+      execution_gates(). Even with automatic_trading_enabled=True,
+      live_execution_armed=True, and every other gate healthy, approved
+      is still False.
+
+  (b) order_client.py's submit_futures_order(): even if a future bug
+      bypassed the gate check entirely, this function still refuses,
+      unconditionally, every single call -- it is the ONLY function in
+      the codebase that could reach a real order endpoint, and it always
+      raises before doing anything network-related.
+
+Proven directly (not just asserted) by
+tests/unit/test_live_execution_safety.py's
+test_every_gate_healthy_except_order_contract_still_means_zero_real_order_calls:
+with automatic_trading_enabled=True, live_execution_armed=True, and a
+fully realistic, fully healthy candidate, every gate EXCEPT
+ORDER_CONTRACT_VERIFIED passes -- and submit_futures_order is still
+called zero times.
+
+============================================================
+4. TESTS ADDED THIS PHASE
+============================================================
+
+tests/unit/test_live_execution_gates.py .......... 22 tests
+tests/unit/test_live_execution_executor.py ........ 12 tests
+tests/unit/test_kill_switch.py ..................... 8 tests
+tests/unit/test_live_execution_daily_loss.py ...... 10 tests
+tests/unit/test_live_execution_reconciliation.py ... 10 tests
+tests/unit/test_live_execution_status_endpoint.py .. 12 tests
+tests/unit/test_live_execution_safety.py (MANDATED) 18 tests
+tests/unit/test_mtproto_listener.py (extended) ..... +2 tests
+tests/unit/test_no_order_placement_capability.py (extended) +5 tests
+
+TOTAL NEW/EXTENDED TESTS THIS PHASE: 99
+
+Full backend suite after this phase:
+  tests/unit:        733 passed
+  tests/integration:   84 passed
+  tests/leakage:       27 passed
+  TOTAL:              844 passed, 0 failed
+
+Frontend (apps/web), unmodified this phase, re-verified healthy:
+  tsc --noEmit:        0 errors
+  vitest run:          24 passed
+  next build:          succeeded (12/12 static pages)
+
+Note on test design: the mandatory duplicate/concurrent-execution proof
+(originally attempted as two real concurrent asyncio sessions racing
+against a shared in-memory SQLite engine) was replaced with two
+deterministic tests -- one proving the database's unique index genuinely
+rejects a duplicate idempotency_key insert, one proving the executor's
+IntegrityError handler correctly defers to the winning row -- because the
+concurrent-session version depended on aiosqlite/SQLAlchemy connection-
+pooling behavior for :memory: databases that is not guaranteed and made
+the test flaky rather than proving anything stronger. The real safety
+mechanism (the DB-level UNIQUE constraint) is what both new tests exercise
+directly.
+
+============================================================
+5. STATIC AUDIT -- CONFIRMED NO PATH TO A REAL ORDER
+============================================================
+
+grep across the full repository (excluding .venv/node_modules) confirms:
+  - submit_futures_order is referenced ONLY in order_client.py (its own
+    definition), executor.py (its one call site, itself unreachable), and
+    test files.
+  - process_live_execution_candidate is called ONLY from within
+    executor.py and test files -- it is NOT wired into the scheduler, the
+    Telegram pipeline, the AI orchestrator, or any router (see Section 6,
+    gap #1).
+  - No httpx / requests / aiohttp import or call exists anywhere under
+    services/live_execution/ or apps/api/routers/live_execution_status.py.
+  - services/telegram_signals/pipeline.py, paper_execution.py,
+    services/scanner/multi_coin.py, and the status router itself contain
+    no reference to submit_futures_order or services.live_execution.
+    order_client.
+
+============================================================
+6. REMAINING BLOCKERS FOR LIVE TRADING (HONEST, NOT EXHAUSTIVE)
+============================================================
+
+1. NOT WIRED: nothing currently calls process_live_execution_candidate()
+   from a real signal source (the scheduler, the Telegram MTProto
+   pipeline, or the AI orchestrator). The full safety pipeline exists and
+   is tested in isolation, but no live signal flows into it yet. Building
+   that wiring was deliberately deferred rather than rushed, since it
+   always terminates at REJECTED today regardless.
+
+2. UNVERIFIED ORDER CONTRACT: the real CoinDCX futures order-creation
+   request schema (order_type, side/position-side semantics, per-order vs
+   per-position leverage setting, native SL/TP attachment mechanism,
+   client-order-ID field) has never been confirmed against a live account.
+
+3. MISSING INSTRUMENT PRECISION DATA: no per-instrument quantity step /
+   minimum quantity / minimum notional / price precision is captured
+   anywhere in this codebase -- required for Section 8's exact-Rs.200
+   position sizing and rounding.
+
+4. NO PERIODIC RECONCILIATION SCHEDULING: reconcile_positions() exists
+   and is tested, but nothing calls it on a schedule yet -- it is a
+   library function, not a running job.
+
+5. NO FRONTEND: Section 27's UI additions (PAPER vs LIVE distinction,
+   Automatic Trading state, Emergency Stop state, Daily Entries, Margin/
+   Leverage display) were not built this phase. The backend status
+   endpoint (GET /api/v1/live-execution/status) already exposes every
+   field a future UI would need.
+
+6. send_live_order_submitted() / send_live_order_filled() exist on the
+   Telegram bot but are not yet called from anywhere, since no candidate
+   can currently reach a state where they would be legitimately triggered.
+
+None of these blockers can be closed by guessing -- each requires either
+manual verification against a real CoinDCX account (items 2-3) or a
+scoped follow-up implementation decision (items 1, 4-6) that was not
+rushed in order to keep this phase's safety guarantees genuine rather
+than assumed.
+
+============================================================
+7. FINAL REPORT (verbatim required fields)
+============================================================
+
+LIVE EXECUTION ARCHITECTURE: PARTIAL (full safety/gating/audit/idempotency/
+  reconciliation architecture built and tested; real order submission
+  permanently blocked pending contract verification; not yet wired to a
+  live signal source)
+PAPER TRADING: ENABLED
+AUTOMATIC TRADING: DISABLED
+REAL ORDERS PLACED: 0
+MARGIN: Rs.200 EXACT
+LEVERAGE: 10x EXACT
+DAILY TARGET: 10
+DAILY HARD MAX: 15
+MULTI-COIN: PASS (INSTRUMENT_ELIGIBLE gate requires caller-supplied,
+  already-verified per-symbol eligibility; unsupported instruments reject,
+  never substitute)
+TELEGRAM SOURCE: @suncrypto_trading_alerts
+AI MODEL: NO_MODEL_DEPLOYED
+KILL SWITCH: PASS
+SL PROTECTION: PASS
+TP MANAGEMENT: PASS
+IDEMPOTENCY: PASS
+POSITION RECONCILIATION: PASS
+MARKET DATA SAFETY: PASS
+ORDER SAFETY: PASS
+SECURITY: PASS
+TESTS: 844 backend passed (0 failed) + 24 frontend passed; 99 tests
+  added/extended this phase
+FILES CHANGED:
+  database/schema/models.py (LiveExecution model + enums, additive)
+  apps/api/config.py (3 new settings, all default-safe)
+  apps/api/routers/__init__.py (router registration)
+  apps/api/routers/live_execution_status.py (new)
+  services/live_execution/__init__.py (new)
+  services/live_execution/kill_switch.py (new)
+  services/live_execution/idempotency.py (new)
+  services/live_execution/gates.py (new)
+  services/live_execution/order_client.py (new)
+  services/live_execution/executor.py (new)
+  services/live_execution/daily_loss.py (new)
+  services/live_execution/reconciliation.py (new)
+  services/telegram/bot.py (2 new notification methods, additive)
+  services/telegram_mtproto/client.py (is_running() bug fix)
+  tests/unit/test_live_execution_gates.py (new)
+  tests/unit/test_live_execution_executor.py (new)
+  tests/unit/test_kill_switch.py (new)
+  tests/unit/test_live_execution_daily_loss.py (new)
+  tests/unit/test_live_execution_reconciliation.py (new)
+  tests/unit/test_live_execution_status_endpoint.py (new)
+  tests/unit/test_live_execution_safety.py (new, mandated)
+  tests/unit/test_mtproto_listener.py (extended)
+  tests/unit/test_no_order_placement_capability.py (extended)
+  reports/LIVE_EXECUTION_V1_REPORT.txt (new, this file)
+BUGS FOUND:
+  MTProtoListener.is_running() misreported False in the healthy,
+  fully-connected state (caught via live server verification).
+FIXES:
+  is_running() now falls back to is_connected() once the supervisory
+  task has finished; verified against a real live MTProto connection.
+COMMIT: (pending -- see next message)
+PUSH: (pending -- see next message)
+DEPLOYED: NO
+REMAINING BLOCKERS FOR LIVE TRADING: see Section 6 above (6 items) --
+  unverified order contract and missing instrument precision data are the
+  two that require manual, real-account verification before any of this
+  can safely be extended toward real trading; the other four are scoped
+  follow-up implementation work, not unknowns.
+
+LIVE TRADING READY: NO. This phase does not claim live trading readiness.

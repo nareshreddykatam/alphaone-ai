@@ -176,6 +176,50 @@ async def test_handle_event_ignores_empty_text_messages():
     assert listener._last_event_at is None  # an ignored (empty-text) event is not a real event
 
 
+async def test_is_running_reports_true_after_run_finishes_successfully_connected():
+    """Real bug caught during live verification: _run() deliberately
+    RETURNS the moment it connects and registers handlers (Telethon's own
+    client keeps receiving independently from there) -- a naive
+    `task is not None and not task.done()` check would report
+    listener_running=False in the fully-connected, healthy state, simply
+    because the setup coroutine finished. is_running() must report True
+    whenever the client is actually connected, even with a finished task."""
+    import asyncio
+
+    listener = MTProtoListener()
+
+    async def _fake_done_task():
+        return None
+
+    listener._task = asyncio.ensure_future(_fake_done_task())
+
+    class _ConnectedClient:
+        def is_connected(self):
+            return True
+
+    listener._client = _ConnectedClient()
+
+    await asyncio.sleep(0)  # let the fake task actually finish
+    assert listener._task.done() is True
+    assert listener.is_running() is True  # must still report running -- connected, not dead
+
+
+async def test_is_running_reports_false_when_task_finished_and_disconnected():
+    import asyncio
+
+    listener = MTProtoListener()
+
+    async def _fake_done_task():
+        return None
+
+    listener._task = asyncio.ensure_future(_fake_done_task())
+    listener._client = None  # never connected, or connect failed
+
+    await asyncio.sleep(0)
+    assert listener._task.done() is True
+    assert listener.is_running() is False
+
+
 def test_status_before_any_connection_reports_disconnected_and_unauthorized():
     listener = MTProtoListener()
     status = listener.get_status()

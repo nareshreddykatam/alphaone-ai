@@ -193,6 +193,63 @@ class TelegramBot:
         )
         await self._send(text)
 
+    async def send_live_order_submitted(self, execution: dict):
+        """Live Futures Auto-Trading V1, Phase 26: sent the moment a real
+        order is actually submitted to CoinDCX -- never before, and never
+        merely because a candidate cleared the safety gates (gate
+        approval alone is not "submitted"). As of this build,
+        services/live_execution/gates.py's ORDER_CONTRACT_VERIFIED gate
+        can never pass, so this method has no real caller yet -- built
+        and tested now so the alert format is ready the moment it does."""
+        if not self.enabled:
+            return
+        rate = await get_usdt_inr_rate()
+
+        def level(usdt_value):
+            usdt_line = format_usdt(usdt_value)
+            inr_line = format_inr(convert_usdt_to_inr(usdt_value, rate)) if rate is not None else "INR conversion unavailable"
+            return f"{usdt_line}\n≈ {inr_line}" if rate is not None else f"{usdt_line}\n({inr_line})"
+
+        emoji = "🟢" if execution.get("direction") == "LONG" else "🔴"
+        tp_lines = [f"TP1:\n{level(execution.get('take_profit_1'))}"]
+        if execution.get("take_profit_2") is not None:
+            tp_lines.append(f"TP2:\n{level(execution.get('take_profit_2'))}")
+        if execution.get("take_profit_3") is not None:
+            tp_lines.append(f"TP3:\n{level(execution.get('take_profit_3'))}")
+
+        text = (
+            f"⚠️ REAL TRADE -- ORDER SUBMITTED\n\n"
+            f"Source:\n{execution.get('source', 'unknown')}\n"
+            f"Symbol:\n{execution.get('symbol', 'unknown')}\n\n"
+            f"{emoji} {execution.get('direction', 'UNKNOWN')}\n\n"
+            f"Entry:\n{level(execution.get('entry_price'))}\n\n"
+            f"Stop Loss:\n{level(execution.get('stop_loss'))}\n\n"
+            + "\n\n".join(tp_lines) + "\n\n"
+            f"Margin:\n₹{execution.get('margin_inr', 200)}\n"
+            f"Leverage:\n{execution.get('leverage', 10)}x\n"
+            f"Quantity:\n{execution.get('quantity')}\n\n"
+            f"Signal ID:\n{execution.get('signal_id', 'unknown')}\n"
+            f"Execution ID:\n{execution.get('execution_id', 'unknown')}"
+        )
+        await self._send(text)
+
+    async def send_live_order_filled(self, execution: dict):
+        """Sent ONLY after CoinDCX confirms the fill -- never at
+        submission time (see send_live_order_submitted above)."""
+        if not self.enabled:
+            return
+        text = (
+            f"✅ REAL TRADE -- ORDER FILLED\n\n"
+            f"Source:\n{execution.get('source', 'unknown')}\n"
+            f"Symbol:\n{execution.get('symbol', 'unknown')}\n"
+            f"Direction:\n{execution.get('direction', 'unknown')}\n"
+            f"Fill Price:\n{format_usdt(execution.get('fill_price'))}\n"
+            f"Quantity:\n{execution.get('quantity')}\n\n"
+            f"Signal ID:\n{execution.get('signal_id', 'unknown')}\n"
+            f"Execution ID:\n{execution.get('execution_id', 'unknown')}"
+        )
+        await self._send(text)
+
     async def send_position_detected(self, position: dict):
         """Sent when a new CoinDCX position is detected during sync
         (Phase 5 section 27) -- purely informational, AlphaOne did not

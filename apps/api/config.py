@@ -70,6 +70,20 @@ class Settings(BaseSettings):
 
     trading_mode: str = "paper"
 
+    # Live Futures Auto-Trading V1 (Phase 12): TWO independent env-var
+    # gates, both required, neither sufficient alone -- deliberately not a
+    # single flag. Both default false. Cannot be changed by a Telegram
+    # message, strategy output, AI output, or any API/frontend request --
+    # only by whoever controls this process's real environment variables.
+    automatic_trading_enabled: bool = False
+    live_execution_armed: bool = False
+    # Hard ceiling on simultaneous REAL positions this system manages.
+    # Deliberately reuses the existing, already-reviewed RiskConfig
+    # default (max_positions=1, services/risk_engine/engine.py) rather
+    # than inventing a new number for real money -- see Phase 16's own
+    # instruction not to guess an appropriate default.
+    max_open_positions_live: int = 1
+
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_cors_origins: str = "http://localhost:3000"

@@ -107,7 +107,18 @@ class MTProtoListener:
         self._last_event_type: Optional[str] = None
 
     def is_running(self) -> bool:
-        return self._task is not None and not self._task.done()
+        """True while the supervisory task is still actively trying to
+        connect/retry, OR once it has finished successfully -- `_run()`
+        deliberately RETURNS the moment it connects and registers event
+        handlers (Telethon's own client keeps receiving independently
+        from there, see `_run()`'s own comment), which makes the task
+        object itself "done" in the healthy, fully-connected state, not
+        just in a failure/cancellation state. So "running" here means
+        "still connecting" OR "connected" -- never conflate a
+        successfully-finished setup coroutine with a dead listener."""
+        if self._task is not None and not self._task.done():
+            return True
+        return self.is_connected()
 
     def is_connected(self) -> bool:
         """A cheap, local, no-network check (Telethon's own internal
