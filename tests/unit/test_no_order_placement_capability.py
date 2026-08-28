@@ -163,10 +163,15 @@ def test_ai_trading_v1_modules_expose_no_order_mutating_function_or_method():
     import services.model_monitor.monitor as monitor_module
     import services.scanner.multi_coin as scanner_module
     import services.scheduler.jobs as jobs_module
+    import services.telegram_signals.parser as tg_parser_module
+    import services.telegram_signals.ingestion as tg_ingestion_module
+    import services.telegram_signals.paper_execution as tg_execution_module
+    import services.risk_engine.fixed_margin as fixed_margin_module
 
     modules = [
         paper_engine_module, paper_persistence_module, orchestrator_module,
         monitor_module, scanner_module, jobs_module,
+        tg_parser_module, tg_ingestion_module, tg_execution_module, fixed_margin_module,
     ]
     classes = [PaperTrader]
 
@@ -185,6 +190,22 @@ def test_ai_trading_v1_modules_expose_no_order_mutating_function_or_method():
             lowered = name.lower()
             for forbidden in FORBIDDEN_SUBSTRINGS:
                 assert forbidden not in lowered, f"{cls.__name__}.{name} looks like an order-mutating method"
+
+
+def test_telegram_signal_pipeline_never_imports_coindcx_order_client():
+    """Phase 36's explicit no-order-placement guarantee: External Telegram
+    -> parser -> ingestion -> risk engine -> paper execution must never
+    import anything from services.exchange.coindcx (the ONLY module in
+    this codebase that talks to CoinDCX's authenticated order endpoints)."""
+    import services.telegram_signals.parser as parser_module
+    import services.telegram_signals.ingestion as ingestion_module
+    import services.telegram_signals.paper_execution as execution_module
+    import services.risk_engine.fixed_margin as fixed_margin_module
+
+    for module in (parser_module, ingestion_module, execution_module, fixed_margin_module):
+        source = inspect.getsource(module)
+        assert "services.exchange.coindcx" not in source, f"{module.__name__} must never import the CoinDCX order client"
+        assert "CoinDCXReadOnlyAccountProvider" not in source
 
 
 def test_paper_trader_never_imports_a_real_exchange_order_client():

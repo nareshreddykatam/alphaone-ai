@@ -328,3 +328,100 @@ async def test_send_paper_signal_is_noop_for_no_trade_direction(monkeypatch):
     monkeypatch.setattr(bot, "_send", fake_send)
     await bot.send_paper_signal({"direction": "NO_TRADE"})
     assert called["count"] == 0
+
+
+def _fake_channel_post(text, username="suncrypto_trading_alerts", message_id="1"):
+    from datetime import datetime
+    post = MagicMock()
+    post.text = text
+    post.chat.username = username
+    post.message_id = message_id
+    post.date = datetime(2026, 1, 1)
+    post.edit_date = None
+    return post
+
+
+@pytest.mark.asyncio
+async def test_channel_post_handler_is_a_noop_when_external_signals_disabled(db_session_maker, monkeypatch):
+    """The default (TELEGRAM_EXTERNAL_SIGNALS_ENABLED=false) -- proves
+    nothing is ingested or acted on out of the box."""
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "telegram_external_signals_enabled", False)
+
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    update = MagicMock()
+    update.channel_post = _fake_channel_post("BTC/USDT LONG\nEntry: 80000\nSL: 79000\nTP1: 83000")
+    update.edited_channel_post = None
+
+    await bot._on_channel_post(update, None)
+
+    async with db_session_maker() as session:
+        from sqlalchemy import select
+        from database.schema.models import ExternalTelegramMessage
+        rows = (await session.execute(select(ExternalTelegramMessage))).scalars().all()
+        assert rows == []  # nothing was even persisted, let alone traded
+
+
+@pytest.mark.asyncio
+async def test_channel_post_handler_ignores_unauthorized_channels(db_session_maker, monkeypatch):
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "telegram_external_signals_enabled", True)
+
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    update = MagicMock()
+    update.channel_post = _fake_channel_post("BTC/USDT LONG\nEntry: 80000\nSL: 79000\nTP1: 83000", username="some_other_channel")
+    update.edited_channel_post = None
+
+    await bot._on_channel_post(update, None)
+
+    async with db_session_maker() as session:
+        from sqlalchemy import select
+        from database.schema.models import ExternalTelegramMessage
+        rows = (await session.execute(select(ExternalTelegramMessage))).scalars().all()
+        assert rows == []  # never even ingested for an unallowlisted channel
+
+
+@pytest.mark.asyncio
+async def test_channel_post_handler_processes_an_authorized_valid_signal_as_paper_only(db_session_maker, monkeypatch):
+    from apps.api.config import get_settings
+    settings = get_settings()
+    monkeypatch.setattr(settings, "telegram_external_signals_enabled", True)
+    monkeypatch.setattr(settings, "telegram_external_signal_channel", "@suncrypto_trading_alerts")
+
+    async def fake_price_lookup(symbol):
+        return 80050.0
+
+    async def fake_get_rate():
+        from services.exchange.fx import ConversionRate
+        import time
+        return ConversionRate(rate=88.0, rate_timestamp=time.time(), fetched_at=time.time())
+
+    import services.scanner.multi_coin as scanner_module
+
+    async def fake_check_availability(symbols):
+        from services.scanner.multi_coin import InstrumentAvailability
+        return [InstrumentAvailability(symbol=s, instrument=f"B-{s}", available=True, last_price=80050.0) for s in symbols]
+
+    monkeypatch.setattr(scanner_module, "check_instrument_availability", fake_check_availability)
+    monkeypatch.setattr("services.exchange.fx.get_usdt_inr_rate", fake_get_rate)
+
+    bot = TelegramBot(bot_token="x", chat_id="y")
+    bot.enabled = False  # no real send attempted regardless
+    update = MagicMock()
+    update.channel_post = _fake_channel_post("BTC/USDT LONG\nEntry: 80000\nSL: 79000\nTP1: 83000")
+    update.edited_channel_post = None
+
+    await bot._on_channel_post(update, None)
+
+    async with db_session_maker() as session:
+        from sqlalchemy import select
+        from database.schema.models import ExternalSignal, Trade, TradeSource
+        signals = (await session.execute(select(ExternalSignal))).scalars().all()
+        assert len(signals) == 1
+        assert signals[0].status == "VALID"
+
+        trades = (await session.execute(select(Trade).where(Trade.source == TradeSource.TELEGRAM_EXTERNAL.value))).scalars().all()
+        assert len(trades) == 1
+        assert trades[0].leverage == 10  # EXACTLY 10x, always

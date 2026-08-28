@@ -14,7 +14,7 @@ supply a real BOT_TOKEN via .env and call `build_app().run_polling()` (see
 from datetime import datetime
 
 from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from sqlalchemy import select
 import structlog
 
@@ -55,6 +55,19 @@ class TelegramBot:
         self._app.add_handler(CommandHandler("risk", self._cmd_risk))
         self._app.add_handler(CommandHandler("pause", self._cmd_pause))
         self._app.add_handler(CommandHandler("resume", self._cmd_resume))
+
+        # Multi-Coin AI Futures System, Phases 22-23: read-only external
+        # signal ingestion. Telegram's Bot API only ever delivers
+        # channel_post/edited_channel_post updates for a channel this bot
+        # has been added to as an ADMINISTRATOR -- a real platform
+        # precondition this code cannot arrange (see
+        # services/telegram_signals/ for the full pipeline this feeds).
+        # Registered unconditionally (harmless no-op if the bot is never
+        # added to any channel); the actual processing inside
+        # _on_channel_post checks settings.telegram_external_signals_enabled
+        # and the source-channel allowlist before doing anything.
+        self._app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, self._on_channel_post))
+        self._app.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST, self._on_channel_post))
         return self._app
 
     # ---- outbound alerts (unchanged formatting, still functional) --------
@@ -284,6 +297,73 @@ class TelegramBot:
             logger.info("Telegram message sent")
         except Exception as e:
             logger.error("Telegram send failed", error=str(e))
+
+    # ---- external signal ingestion (read-only; see services/telegram_signals/) ----
+
+    async def _on_channel_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Multi-Coin AI Futures System, Phases 21-27: the ONLY code path
+        that ever reads from the external signal channel. Never replies,
+        forwards, or sends anything back to it -- this handler only
+        writes to AlphaOne's own database. Fully no-ops (does not even
+        touch the DB) unless TELEGRAM_EXTERNAL_SIGNALS_ENABLED=true, and
+        further ignores anything not from the exact allowlisted channel.
+        """
+        post = update.channel_post or update.edited_channel_post
+        if post is None or not post.text:
+            return
+
+        from apps.api.config import get_settings
+        settings = get_settings()
+        if not settings.telegram_external_signals_enabled:
+            return
+
+        from services.telegram_signals.ingestion import is_authorized_channel, ingest_message, process_message
+        from services.telegram_signals.paper_execution import execute_valid_signal
+
+        channel = f"@{post.chat.username}" if post.chat.username else str(post.chat.id)
+        if not is_authorized_channel(channel):
+            logger.warning("Ignoring channel post from an unauthorized/unallowlisted channel", channel=channel)
+            return
+
+        is_edit = update.edited_channel_post is not None
+        async with async_session() as session:
+            message = await ingest_message(
+                session, channel, str(post.message_id), post.date.replace(tzinfo=None),
+                post.text, edited_timestamp=(post.edit_date.replace(tzinfo=None) if is_edit and post.edit_date else None),
+            )
+
+            from services.scanner.multi_coin import DEFAULT_WHITELIST
+            supported = set(DEFAULT_WHITELIST)
+
+            async def _price_lookup(symbol: str):
+                from services.scanner.multi_coin import check_instrument_availability
+                results = await check_instrument_availability([symbol])
+                return results[0].last_price if results and results[0].available else None
+
+            signal = await process_message(session, message, supported, current_price_lookup=_price_lookup)
+            logger.info("External Telegram signal processed", channel=channel, status=signal.status, symbol=signal.symbol)
+
+            if signal.status == "VALID":
+                from services.exchange.fx import get_usdt_inr_rate
+                rate = await get_usdt_inr_rate()
+                inr_rate = rate.rate if rate is not None else None
+                position, reason = await execute_valid_signal(session, signal, inr_rate)
+                if position is not None:
+                    logger.info("External Telegram signal opened a paper position", trade_id=position.trade_id)
+                    if self.enabled:
+                        await self.send_paper_signal({
+                            "symbol": signal.symbol, "market": f"CoinDCX {signal.symbol} Perpetual",
+                            "timeframe": signal.timeframe_stated or "unspecified",
+                            "strategy_sources": [f"TELEGRAM:{channel}"], "direction": signal.direction,
+                            "probability_long": None, "probability_short": None, "probability_no_trade": None,
+                            "expected_return": None, "expected_volatility": None, "regime": "UNKNOWN",
+                            "confidence": "EXTERNAL_SIGNAL", "entry": signal.entry_price, "stop_loss": signal.stop_loss,
+                            "take_profit_1": signal.take_profit_1, "take_profit_2": signal.take_profit_2,
+                            "take_profit_3": signal.take_profit_3, "risk_reward": None,
+                            "model_status": "NO_MODEL_DEPLOYED", "model_version": None,
+                        })
+                else:
+                    logger.info("External Telegram signal was VALID but not executed", reason=reason)
 
     # ---- inbound commands, all real DB reads --------------------------
 

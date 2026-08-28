@@ -40,6 +40,7 @@ class TradeSource(str, enum.Enum):
     SUNCRYPTO_SYNC = "SUNCRYPTO_SYNC"  # Phase 4, kept for historical rows -- no longer the active exchange
     COINDCX_SYNC = "COINDCX_SYNC"
     AI_PAPER = "AI_PAPER"  # AI Trading V1: opened by services/signal_engine/ai_orchestrator.py + services/paper_trader, never a real fill
+    TELEGRAM_EXTERNAL = "TELEGRAM_EXTERNAL"  # Multi-Coin AI Futures System: opened from a parsed, validated external Telegram signal, never a real fill
 
 
 class SignalQuality(str, enum.Enum):
@@ -514,3 +515,70 @@ class NotificationLog(Base):
     status = Column(String(20), nullable=False)
     error = Column(Text)
     sent_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ExternalSignalStatus(str, enum.Enum):
+    VALID = "VALID"
+    INVALID = "INVALID"
+    INCOMPLETE = "INCOMPLETE"
+    AMBIGUOUS = "AMBIGUOUS"
+    UNSUPPORTED_SYMBOL = "UNSUPPORTED_SYMBOL"
+    UNSUPPORTED_MARKET = "UNSUPPORTED_MARKET"
+    ENTRY_TOO_FAR = "ENTRY_TOO_FAR"
+    ENTRY_STALE = "ENTRY_STALE"
+    REJECTED_UNAUTHORIZED_SOURCE = "REJECTED_UNAUTHORIZED_SOURCE"
+
+
+class ExternalTelegramMessage(Base):
+    """Raw ingestion record for a read-only external Telegram channel post
+    (Multi-Coin AI Futures System, Phase 23). Never mutated after receipt
+    except for `edited_text`/`edited_at` on a real Telegram edit event --
+    the original `text`/`received_at` are preserved so a parse can always
+    be traced back to exactly what was actually posted."""
+    __tablename__ = "external_telegram_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_channel = Column(String(100), nullable=False)
+    telegram_message_id = Column(String(30), nullable=False)
+    message_timestamp = Column(DateTime, nullable=False)
+    edited_timestamp = Column(DateTime, nullable=True)
+    text = Column(Text, nullable=False)
+    edited_text = Column(Text, nullable=True)
+    raw_hash = Column(String(64), nullable=False)
+    received_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_ext_tg_msg_channel_msgid", "source_channel", "telegram_message_id", unique=True),
+    )
+
+
+class ExternalSignal(Base):
+    """Parsed (and validated) result of one ExternalTelegramMessage. A
+    message that fails parsing/validation still gets a row here (status +
+    rejection_reason) -- rejections are tracked, not silently dropped, per
+    reports/TELEGRAM_SIGNAL_RESEARCH_V1.txt's requirement to report
+    rejected-signal counts honestly."""
+    __tablename__ = "external_signals"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    message_id = Column(UUID(as_uuid=True), ForeignKey("external_telegram_messages.id"), nullable=False)
+    source_channel = Column(String(100), nullable=False)
+    status = Column(String(30), nullable=False)
+    rejection_reason = Column(Text, nullable=True)
+    raw_symbol = Column(String(30), nullable=True)
+    symbol = Column(String(20), nullable=True)  # normalized "BASE/USDT", null if unparseable/unsupported
+    direction = Column(String(10), nullable=True)
+    entry_price = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    take_profit_1 = Column(Float, nullable=True)
+    take_profit_2 = Column(Float, nullable=True)
+    take_profit_3 = Column(Float, nullable=True)
+    leverage_stated = Column(Integer, nullable=True)
+    timeframe_stated = Column(String(10), nullable=True)
+    market_price_at_validation = Column(Float, nullable=True)
+    trade_id = Column(String(30), nullable=True)  # set once a VALID signal clears risk checks and opens a paper Trade
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_external_signals_message_id", "message_id"),
+    )

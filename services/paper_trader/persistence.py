@@ -22,18 +22,27 @@ from database.schema.models import (
 from services.paper_trader.engine import PaperPosition
 
 
-async def get_open_paper_trade(session: AsyncSession, symbol: str = "BTC/USDT") -> Optional[Trade]:
+async def get_open_paper_trade(session: AsyncSession, symbol: str = "BTC/USDT", source: Optional[str] = None) -> Optional[Trade]:
+    """`source` (e.g. TradeSource.TELEGRAM_EXTERNAL.value) optionally
+    scopes the lookup so different sources never see each other's open
+    positions on the same symbol as a blocking duplicate -- Phase 32:
+    'Maintain separate sources... Do NOT merge their results.'"""
+    conditions = [
+        Trade.symbol == symbol, Trade.mode == "paper",
+        Trade.status.in_([TradeStatus.OPEN.value, TradeStatus.PARTIALLY_CLOSED.value]),
+    ]
+    if source is not None:
+        conditions.append(Trade.source == source)
     result = await session.execute(
-        select(Trade).where(
-            Trade.symbol == symbol, Trade.mode == "paper", Trade.status.in_(
-                [TradeStatus.OPEN.value, TradeStatus.PARTIALLY_CLOSED.value]
-            ),
-        ).order_by(Trade.entry_time.desc())
+        select(Trade).where(*conditions).order_by(Trade.entry_time.desc())
     )
     return result.scalars().first()
 
 
-async def persist_paper_open(session: AsyncSession, position: PaperPosition, symbol: str = "BTC/USDT") -> Trade:
+async def persist_paper_open(
+    session: AsyncSession, position: PaperPosition, symbol: str = "BTC/USDT",
+    source: str = TradeSource.AI_PAPER.value,
+) -> Trade:
     trade = Trade(
         trade_id=position.trade_id,
         signal_id=position.signal_id,
@@ -51,7 +60,7 @@ async def persist_paper_open(session: AsyncSession, position: PaperPosition, sym
         entry_time=position.entry_time,
         market_regime=position.market_regime,
         is_manual_entry=False,
-        source=TradeSource.AI_PAPER.value,
+        source=source,
         data_source=DataSourceKind.SYNCED.value,
     )
     session.add(trade)

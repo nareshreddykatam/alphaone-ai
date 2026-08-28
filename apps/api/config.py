@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     telegram_enabled: bool = False
 
+    # Multi-Coin AI Futures System: external, read-only Telegram signal
+    # ingestion (see services/telegram_signals/). Off by default, and
+    # functionally inert even when true unless AlphaOne's bot has been
+    # added as an ADMINISTRATOR of this channel by its owner -- a real
+    # Telegram-platform precondition this code cannot arrange or fake.
+    telegram_external_signals_enabled: bool = False
+    telegram_external_signal_channel: str = "@suncrypto_trading_alerts"
+
     model_path: str = "./ml/models"
     model_version: str = "v1"
     prediction_threshold: float = 0.55

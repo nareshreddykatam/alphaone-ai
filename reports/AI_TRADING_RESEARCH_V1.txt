@@ -434,3 +434,56 @@ simulated only, in the Trade table with mode="paper", clearly distinct
 from any real CoinDCX-synced position (mode/source columns). Telegram's
 send_paper_signal always states "PAPER TRADE -- NO REAL ORDER PLACED" in
 both its header and footer.
+
+============================================================
+ADDENDUM -- MULTI-COIN AI FUTURES SYSTEM
+============================================================
+
+This addendum covers what a later pass added on top of everything above.
+See reports/TELEGRAM_SIGNAL_RESEARCH_V1.txt for the external-signal
+research this same pass produced.
+
+Multi-coin scanner eligibility (Phase 4): services/scanner/multi_coin.py
+now applies real liquidity (24h volume >= $10M USDT) and data-freshness
+(last tick <= 120s old) eligibility checks, using CoinDCX's real public
+ticker fields (`v` for 24h volume, `ctRT` for the tick's own receive
+timestamp) -- never assumed present; missing data is treated as
+INELIGIBLE, not silently passed. BTC/USDT, ETH/USDT, SOL/USDT, and
+XRP/USDT all clear both thresholds using real observed data from this
+task's own live verification (BTC ~$15B, ETH ~$11B, SOL ~$4B, XRP ~$1.5B
+24h volume). Only BTC/USDT is SCORED (has validated strategies); every
+other eligible symbol still reports NOT_VALIDATED, unchanged from before.
+
+Fixed-margin risk engine (Phases 17-19, services/risk_engine/
+fixed_margin.py): a dedicated, separate risk module for this system's
+specific constraint -- Rs.200 margin and EXACTLY 10x leverage (a hardcoded
+constant, never a parameter any signal/model/strategy can influence) --
+distinct from the pre-existing percent-of-equity RiskEngine, which serves
+a genuinely different sizing philosophy and was left untouched. The daily
+trade counter (10-trade TARGET, 15-trade HARD MAXIMUM) is a real COUNT
+query against the Trade table (entry_time in the current UTC calendar
+day, across the shared AI_PAPER + TELEGRAM_EXTERNAL source pool) -- not an
+in-memory counter, so it is correct across process restarts. The target
+is informational only; only the 15-trade maximum ever blocks a trade,
+confirmed by tests/unit/test_fixed_margin_risk.py.
+
+Multi-coin position independence (Phase 20): a dedicated paper-trading
+book (services/telegram_signals/live_state.py) with a generous concurrent-
+position ceiling (distinct from AI Trading V1's original single-BTC
+paper_trader, which correctly limits to 1 concurrent position for its own
+single-symbol design) -- verified with a real test opening BTC LONG + ETH
+SHORT + SOL LONG simultaneously, each with its own correct entry/SL/TP,
+none blocking or overwriting another (tests/unit/test_telegram_paper_execution.py).
+
+Real bugs found by this pass's own tests, both fixed before commit:
+1. services/model_monitor/monitor.py's drawdown calculation started
+   equity at $0 instead of a realistic reference balance, producing
+   nonsensical drawdown percentages (one test case computed 766%) that
+   were also spuriously triggering WARNING/DEGRADED status on genuinely
+   healthy trade sequences. Fixed by starting from a $10,000 reference
+   equity, matching PaperTrader's own default.
+2. services/scanner/multi_coin.py's new eligibility-rejection messages
+   crashed with a TypeError when formatting a None tick-age/volume value
+   (an instrument the ticker returned no `ctRT`/`v` field for). Fixed to
+   describe missing data explicitly rather than assuming it's always
+   present.

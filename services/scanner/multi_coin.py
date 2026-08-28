@@ -17,6 +17,7 @@ fabricated score; this module's job here is to prove the architecture
 generalizes (real instrument check, real ticker data, a uniform
 ScanResult shape), not to pretend a second coin has been researched.
 """
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +27,14 @@ import structlog
 logger = structlog.get_logger()
 
 COINDCX_TICKER_URL = "https://public.coindcx.com/market_data/v3/current_prices/futures/rt"
+
+# Real eligibility thresholds (Phase 4) -- deliberately conservative and
+# far below every liquid major's real 24h volume (BTC ~$15B, ETH ~$11B,
+# SOL ~$4B, XRP ~$1.5B observed during this task's own live verification),
+# so these only ever filter out a genuinely thin/stale instrument, not
+# any of the intended liquid-majors whitelist.
+MIN_24H_VOLUME_USDT = 10_000_000.0
+MAX_TICK_AGE_SECONDS = 120.0
 
 # Small, explicit whitelist -- liquid majors only. Adding a symbol here
 # does NOT make it tradeable; it only makes it eligible to be scanned, and
@@ -63,6 +72,16 @@ class InstrumentAvailability:
     last_price: Optional[float] = None
     funding_rate: Optional[float] = None
     mark_price: Optional[float] = None
+    volume_24h: Optional[float] = None
+    tick_age_seconds: Optional[float] = None
+
+    @property
+    def is_liquid(self) -> bool:
+        return self.volume_24h is not None and self.volume_24h >= MIN_24H_VOLUME_USDT
+
+    @property
+    def is_fresh(self) -> bool:
+        return self.tick_age_seconds is not None and self.tick_age_seconds <= MAX_TICK_AGE_SECONDS
 
 
 async def check_instrument_availability(symbols: list[str], client: Optional[httpx.AsyncClient] = None) -> list[InstrumentAvailability]:
@@ -82,9 +101,12 @@ async def check_instrument_availability(symbols: list[str], client: Optional[htt
             if data is None:
                 results.append(InstrumentAvailability(symbol=symbol, instrument=instrument, available=False))
             else:
+                tick_ms = data.get("ctRT")
+                tick_age = (time.time() * 1000 - tick_ms) / 1000 if tick_ms is not None else None
                 results.append(InstrumentAvailability(
                     symbol=symbol, instrument=instrument, available=True,
                     last_price=data.get("ls"), funding_rate=data.get("fr"), mark_price=data.get("mp"),
+                    volume_24h=data.get("v"), tick_age_seconds=tick_age,
                 ))
     except httpx.HTTPError as e:
         logger.warning("CoinDCX instrument availability check failed", error=str(e))
@@ -115,6 +137,22 @@ async def scan_symbol(symbol: str, availability: InstrumentAvailability) -> Scan
             symbol=symbol, status="INSTRUMENT_UNAVAILABLE",
             reason=f"{availability.instrument} did not return live data from CoinDCX's public ticker.",
             instrument_available=False,
+        )
+
+    if not availability.is_fresh:
+        age_desc = f"{availability.tick_age_seconds:.0f}s old" if availability.tick_age_seconds is not None else "unknown (no tick timestamp returned)"
+        return ScanResult(
+            symbol=symbol, status="INELIGIBLE_STALE_DATA",
+            reason=f"Last tick is {age_desc} (max {MAX_TICK_AGE_SECONDS:.0f}s) -- not evaluated on stale data.",
+            instrument_available=True, last_price=availability.last_price,
+        )
+
+    if not availability.is_liquid:
+        volume_desc = availability.volume_24h if availability.volume_24h is not None else "unknown (no volume returned)"
+        return ScanResult(
+            symbol=symbol, status="INELIGIBLE_LIQUIDITY",
+            reason=f"24h volume {volume_desc} USDT is below the minimum eligibility threshold ({MIN_24H_VOLUME_USDT:,.0f} USDT).",
+            instrument_available=True, last_price=availability.last_price,
         )
 
     if symbol not in RESEARCHED_SYMBOLS:

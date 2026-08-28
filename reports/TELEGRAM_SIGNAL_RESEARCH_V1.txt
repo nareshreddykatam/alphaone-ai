@@ -1,0 +1,188 @@
+============================================================
+ALPHAONE AI -- MULTI-COIN AI FUTURES SYSTEM
+EXTERNAL TELEGRAM SIGNAL RESEARCH V1
+============================================================
+
+Real infrastructure, honestly reported. This report does NOT claim any
+real external signal has been received -- because none has, and the
+reason why is explained in Section 1 rather than hidden.
+
+============================================================
+1. CONNECTION STATUS -- READ FIRST
+============================================================
+
+TELEGRAM SIGNALS RECEIVED FROM @suncrypto_trading_alerts: 0
+REASON: not connected. This is a real platform limitation, not a bug in
+this codebase, and not something this task could resolve on its own.
+
+AlphaOne's existing Telegram integration (services/telegram/bot.py) uses
+python-telegram-bot, a wrapper around Telegram's official BOT API. The Bot
+API can only ever receive `channel_post` updates for a channel where the
+bot has been explicitly added as an ADMINISTRATOR by that channel's owner
+-- there is no way for a bot to "subscribe" to or "listen in on" an
+arbitrary public channel it does not administer. @suncrypto_trading_alerts
+is a third-party channel; nothing in this session added AlphaOne's bot to
+it (that action can only be taken by the channel's own owner/admins, via
+Telegram itself, outside this codebase).
+
+Two real paths exist to make this connection real:
+  (a) The channel owner adds AlphaOne's existing bot as an administrator
+      of @suncrypto_trading_alerts. No new code or library is needed --
+      the real handler (TelegramBot._on_channel_post, registered on
+      filters.UpdateType.CHANNEL_POST/EDITED_CHANNEL_POST) is already
+      wired up and will start receiving real channel_post updates the
+      moment that happens, with TELEGRAM_EXTERNAL_SIGNALS_ENABLED=true
+      and TELEGRAM_EXTERNAL_SIGNAL_CHANNEL=@suncrypto_trading_alerts set.
+  (b) A user-account (MTProto) connection via a library like Telethon,
+      requiring a real Telegram API_ID/API_HASH (from my.telegram.org)
+      and a phone-number login session -- a fundamentally different,
+      heavier credential model. Not implemented in this pass: no such
+      credentials exist, and per explicit instruction, none were invented
+      or requested speculatively.
+
+Everything below this section is real, tested infrastructure -- verified
+against real, representative example message text (never a claim of
+having "received" anything) -- ready to process real messages the moment
+path (a) or (b) above is actually established.
+
+============================================================
+2. WHAT WAS BUILT AND TESTED
+============================================================
+
+Parser (services/telegram_signals/parser.py): a pure function, no network
+dependency, verified against BOTH message shapes given in this task's own
+spec plus 24 additional edge cases (tests/unit/test_telegram_signal_parser.py,
+26 tests, all passing):
+
+  "BTCUSDT LONG
+   Entry: 81300
+   SL: 79000
+   TP1: 83000
+   TP2: 84500"                                    -> VALID
+
+  "BTC/USDT SHORT
+   Entry 81300
+   Stop Loss 82000
+   Target 1 80000
+   Target 2 79000"                                -> VALID
+
+Vague messages that must NEVER become a trade, confirmed rejected:
+  "BTC LONG"        -> INVALID (no parseable USDT symbol)
+  "Buy BTC"         -> INVALID (no parseable USDT symbol)
+  "BTC long soon"   -> INVALID (no parseable USDT symbol)
+
+Every possible status is real and tested:
+  VALID / INVALID / INCOMPLETE / AMBIGUOUS / UNSUPPORTED_SYMBOL /
+  UNSUPPORTED_MARKET / ENTRY_TOO_FAR / ENTRY_STALE /
+  REJECTED_UNAUTHORIZED_SOURCE
+
+Symbol normalization tested: BTCUSDT / BTC/USDT / BTC-USDT / "btc usdt"
+all normalize to "BTC/USDT". BUY/SELL normalize to LONG/SHORT.
+
+Ingestion (services/telegram_signals/ingestion.py, 12 tests): real
+message-ID-based deduplication (a duplicate delivery of the same
+(channel, message_id) is recognized, not reprocessed), real edited-
+message handling (a newer edit updates edited_text without destroying the
+original text; an out-of-order/stale edit replay is correctly ignored),
+and real market-price validation (an entry >1% away from the current
+CoinDCX price is rejected as ENTRY_TOO_FAR, never chased; no live price
+available -> ENTRY_STALE, never assumed valid).
+
+Authorization (Phase 21): only @suncrypto_trading_alerts is processed.
+Verified: a message from any other channel is rejected at
+REJECTED_UNAUTHORIZED_SOURCE before even being parsed.
+
+Fixed-margin execution (services/telegram_signals/paper_execution.py, 5
+tests): a VALID signal is sized at EXACTLY Rs.200 margin / EXACTLY 10x
+leverage (services/risk_engine/fixed_margin.py, 13 tests covering the
+sizing math, the daily-budget query, and the 15-trade hard maximum) and
+opened as a real paper Trade (mode="paper", source="TELEGRAM_EXTERNAL").
+Verified with real concurrent, independent multi-coin positions: BTC
+LONG + ETH SHORT + SOL LONG open simultaneously, each retaining its own
+correct entry/SL/TP, none blocking or overwriting another
+(tests/unit/test_telegram_paper_execution.py).
+
+End-to-end integration (tests/unit/test_telegram_bot.py, 3 new tests):
+the REAL TelegramBot._on_channel_post handler -- not just the underlying
+functions in isolation -- correctly (1) no-ops entirely when
+TELEGRAM_EXTERNAL_SIGNALS_ENABLED is false (the default), (2) ignores an
+unauthorized channel's post without persisting anything, and (3) fully
+processes an authorized, valid signal through to a real paper Trade row
+with leverage=10.
+
+============================================================
+3-16. SIGNAL/PAPER-TRADE STATISTICS
+============================================================
+
+Not applicable this pass -- see Section 1. Every count below is 0
+because there is no real external signal source connected yet, not
+because of a bug or an incomplete pipeline:
+
+  Signal count:              0
+  Valid signals:             0
+  Rejected signals:          0
+  Paper trades opened:       0
+  LONG/SHORT breakdown:      n/a
+  Coin breakdown:            n/a
+  Timeframe breakdown:       n/a
+  Win rate:                  n/a
+  Profit factor:             n/a
+  Expectancy:                n/a
+  Net P&L:                   n/a
+  Max drawdown:              n/a
+  Average R:                 n/a
+  TP1/TP2/TP3 hit rates:     n/a
+  SL rate:                   n/a
+  Fees / slippage / funding: n/a
+  Expired signals:           n/a
+
+Once path (a) or (b) in Section 1 is established, these statistics become
+real and queryable directly from the external_telegram_messages/
+external_signals/trades tables -- no additional code is needed to start
+collecting them.
+
+============================================================
+17. LIMITATIONS
+============================================================
+
+- No real external signal has been received or processed -- this is an
+  infrastructure-readiness report, not a performance report.
+- The parser handles the two example formats given plus reasonable
+  variations (colon vs. word labels, "Target N" vs "TPN", optional
+  leverage/timeframe tags) -- it has NOT been tested against the actual,
+  real historical message style of @suncrypto_trading_alerts, since no
+  access to that channel's history exists. Real messages may use a format
+  this parser doesn't yet recognize, in which case they will correctly
+  come back INVALID/INCOMPLETE (never silently mistraded) but will need a
+  follow-up parser update once real examples are available.
+- Entry-deviation validation (1% max) and the liquidity/freshness
+  eligibility thresholds (Section "Multi-Coin scanner eligibility" in
+  reports/AI_TRADING_RESEARCH_V1.txt's addendum) are reasonable, fixed,
+  pre-declared defaults -- not tuned against any real trade data, since
+  none exists yet.
+- MTProto-based ingestion (path (b) in Section 1) is not implemented; only
+  the Bot-API-admin path is real, working code today.
+
+============================================================
+18. WHAT REMAINS RESEARCH-ONLY / NOT YET LIVE
+============================================================
+
+The entire external-signal pipeline is PAPER-ONLY infrastructure. Nothing
+here trades real money under any circumstances in this pass (see
+tests/unit/test_no_order_placement_capability.py's dedicated coverage of
+every new module in this system, confirming no path from Telegram parsing
+through to a real CoinDCX order call exists anywhere).
+
+============================================================
+19. WHAT REQUIRES EXTERNAL CONFIGURATION/ACTION
+============================================================
+
+1. The channel owner of @suncrypto_trading_alerts must add AlphaOne's
+   Telegram bot as an administrator of that channel for real ingestion to
+   begin (see Section 1). AlphaOne cannot arrange this itself.
+2. TELEGRAM_EXTERNAL_SIGNALS_ENABLED must be explicitly set to true (env
+   var) -- it defaults to false, so no ingestion happens even if (1) is
+   done, until this is deliberately turned on.
+3. TELEGRAM_EXTERNAL_SIGNAL_CHANNEL defaults to
+   "@suncrypto_trading_alerts" already -- no change needed unless a
+   different or additional channel is later authorized.
