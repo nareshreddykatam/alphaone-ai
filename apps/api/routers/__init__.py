@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from apps.api.routers import (
     dashboard, signals, trades, performance, model, risk, settings, health,
-    accounts, journal, portfolio, market,
+    accounts, journal, portfolio, market, telegram_status,
 )
 
 api_router = APIRouter()
@@ -18,3 +18,4 @@ api_router.include_router(accounts.router, prefix="/accounts", tags=["Accounts"]
 api_router.include_router(journal.router, prefix="/journal", tags=["Trade Journal"])
 api_router.include_router(portfolio.router, prefix="/portfolio", tags=["Portfolio"])
 api_router.include_router(market.router, prefix="/market", tags=["Market Data"])
+api_router.include_router(telegram_status.router, prefix="/telegram", tags=["Telegram"])

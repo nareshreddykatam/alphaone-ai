@@ -266,6 +266,18 @@ def test_pipeline_never_imports_coindcx_order_client():
     assert "CoinDCXReadOnlyAccountProvider" not in source
 
 
+def test_telegram_status_router_is_read_only_and_never_imports_order_client():
+    """GET /api/v1/telegram/mtproto-status (apps/api/routers/telegram_status.py)
+    is pure observability -- must never import the CoinDCX order client
+    and must not define a POST/PUT/PATCH/DELETE handler anywhere."""
+    import apps.api.routers.telegram_status as status_module
+    source = inspect.getsource(status_module)
+    assert "services.exchange.coindcx" not in source
+    assert "CoinDCXReadOnlyAccountProvider" not in source
+    for forbidden in ("@router.post", "@router.put", "@router.patch", "@router.delete"):
+        assert forbidden not in source
+
+
 def test_paper_trader_never_imports_a_real_exchange_order_client():
     """The paper-trading engine must never import anything from
     services.exchange.coindcx beyond what read-only market context needs
