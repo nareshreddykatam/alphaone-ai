@@ -333,8 +333,8 @@ BUGS FOUND:
 FIXES:
   is_running() now falls back to is_connected() once the supervisory
   task has finished; verified against a real live MTProto connection.
-COMMIT: (pending -- see next message)
-PUSH: (pending -- see next message)
+COMMIT: 2508b98
+PUSH: origin/master 21fd02d..2508b98 (succeeded)
 DEPLOYED: NO
 REMAINING BLOCKERS FOR LIVE TRADING: see Section 6 above (6 items) --
   unverified order contract and missing instrument precision data are the
